@@ -1313,6 +1313,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           has_openai_key: !!stt?.openai?.api_key,
           has_groq_key: !!stt?.groq?.api_key,
           has_sarvam_key: !!stt?.sarvam?.api_key,
+          sarvam_language: stt?.sarvam?.language ?? 'unknown',
           local_endpoint: stt?.local?.endpoint ?? null,
           local_server_type: stt?.local?.server_type ?? 'whisper_cpp',
         });
@@ -1323,8 +1324,8 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           const { loadConfig, saveConfig } = await import('../config/loader.ts');
           const freshConfig = await loadConfig();
 
-          if (!freshConfig.stt) freshConfig.stt = {} as any;
-          const stt = freshConfig.stt!;
+          if (!freshConfig.stt) freshConfig.stt = { provider: 'openai' };
+          const stt = freshConfig.stt;
 
           // Preserve keys for each provider if not provided in the update
           const providers = ['openai', 'groq', 'sarvam'] as const;
@@ -1383,7 +1384,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           const { loadConfig, saveConfig } = await import('../config/loader.ts');
           const freshConfig = await loadConfig();
 
-          if (!freshConfig.tts) freshConfig.tts = {} as any;
+          if (!freshConfig.tts) freshConfig.tts = { enabled: false };
 
           // Deep-merge elevenlabs sub-object to preserve API key across saves
           const incomingEl = body.elevenlabs as Record<string, unknown> | undefined;
@@ -1685,7 +1686,9 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           if (!body.action) return error('Missing "action" field');
           ctx.learner.resetPattern(body.action, body.tool_name ?? '');
           return json({ ok: true });
-        } catch (err) { return error('Invalid request body'); }
+        } catch (err) {
+          return error('Invalid request body');
+        }
       },
     },
 
