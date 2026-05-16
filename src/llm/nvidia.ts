@@ -107,7 +107,7 @@ export class NVIDIAProvider implements LLMProvider {
     if (max_tokens !== undefined) body.max_tokens = max_tokens;
     if (tools && tools.length > 0) {
       body.tools = this.convertTools(tools);
-      body.tool_choice = undefined;
+      body.tool_choice = tool_choice || 'auto';
     }
 
     const response = await fetch(this.apiUrl, {
@@ -145,7 +145,7 @@ export class NVIDIAProvider implements LLMProvider {
     if (max_tokens !== undefined) body.max_tokens = max_tokens;
     if (tools && tools.length > 0) {
       body.tools = this.convertTools(tools);
-      body.tool_choice = undefined;
+      body.tool_choice = tool_choice || 'auto';
     }
 
     const response = await fetch(this.apiUrl, {

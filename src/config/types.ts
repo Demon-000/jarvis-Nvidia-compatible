@@ -91,7 +91,6 @@ export type AwarenessConfig = {
     full_hours: number;
     key_moment_hours: number;
   };
-  capture_dir: string;
 };
 
 export type PerActionOverride = {
@@ -222,6 +221,7 @@ export type JarvisConfig = {
     ollama?: { base_url?: string; model?: string };
     openrouter?: { api_key: string; model?: string };
     nvidia?: { api_key: string; model?: string };
+    openai_compatible?: { base_url?: string; api_key?: string; model?: string };
   };
   personality: {
     core_traits: string[];
@@ -290,7 +290,6 @@ export const DEFAULT_CONFIG: JarvisConfig = {
       full_hours: 1,
       key_moment_hours: 24,
     },
-    capture_dir: '~/.jarvis/captures',
   },
   llm: {
     primary: 'anthropic',
