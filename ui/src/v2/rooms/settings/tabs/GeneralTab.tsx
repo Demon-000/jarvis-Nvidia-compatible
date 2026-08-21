@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import type { SettingsHook } from "../useSettingsData";
+import { confirmDialog } from "../../../ui/ConfirmDialog";
 import {
   resetOnboarding,
   type OnboardingResetScope,
@@ -18,7 +19,7 @@ export function GeneralTab({
   const [restarting, setRestarting] = useState(false);
 
   const handleRestart = async () => {
-    if (!confirm("Restart Jarvis now? Your dashboard will reconnect after a few seconds.")) return;
+    if (!await confirmDialog("Restart Jarvis now? Your dashboard will reconnect after a few seconds.")) return;
     setRestarting(true);
     const r = await data.restartDaemon();
     onToast(r.message, r.ok ? "ok" : "warn");
@@ -245,13 +246,13 @@ export function GeneralTab({
                 ))}
               </div>
             </div>
-            {role.role.sub_roles.length > 0 && (
+            {(role.role.sub_roles?.length ?? 0) > 0 && (
               <div className="v2-set__field">
                 <span className="v2-set__field-label">
-                  Available specialists ({role.role.sub_roles.length})
+                  Available specialists ({role.role.sub_roles?.length ?? 0})
                 </span>
                 <div style={{ display: "flex", flexDirection: "column", gap: "var(--s-2)" }}>
-                  {role.role.sub_roles.map((sr) => (
+                  {(role.role.sub_roles ?? []).map((sr) => (
                     <div
                       key={sr.role_id}
                       style={{
@@ -302,7 +303,7 @@ function RerunSetupSection({
 
   const handleRerun = async () => {
     if (
-      !confirm(
+      !await confirmDialog(
         "Re-run first-time setup? You'll be sent back to the LLM provider + TTS picker. Your saved profile and tutorial state are preserved. The page will reload.",
       )
     )
@@ -383,7 +384,7 @@ function OnboardingDebugSection({
           : scope === "profile"
             ? "the profile interview (your saved profile will be cleared)"
             : "the dashboard tutorial";
-    if (!confirm(`Replay ${label}? The page will reload.`)) return;
+    if (!await confirmDialog(`Replay ${label}? The page will reload.`)) return;
     setBusy(true);
     try {
       // resetOnboarding triggers a full page reload on success, so the

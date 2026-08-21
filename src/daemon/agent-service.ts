@@ -9,19 +9,28 @@
 import { join } from 'node:path';
 import type { Service, ServiceStatus } from './services.ts';
 import type { JarvisConfig } from '../config/types.ts';
-import type { LLMStreamEvent } from '../llm/provider.ts';
+import type { LLMStreamEvent, LLMMessage, LLMErrorCode } from '../llm/provider.ts';
 import type { RoleDefinition } from '../roles/types.ts';
 import type { PersonalityModel } from '../personality/model.ts';
 
 import { LLMManager } from '../llm/manager.ts';
-import { AnthropicProvider } from '../llm/anthropic.ts';
-import { OpenAIProvider } from '../llm/openai.ts';
-import { GroqProvider } from '../llm/groq.ts';
-import { GeminiProvider } from '../llm/gemini.ts';
-import { OllamaProvider } from '../llm/ollama.ts';
-import { OpenRouterProvider } from '../llm/openrouter.ts';
-import { NVIDIAProvider } from '../llm/nvidia.ts';
-import { OpenAICompatibleProvider } from '../llm/openai-compatible.ts';
+import { activeTurns, DrainingError } from './active-turns.ts';
+import { registerLLMProviders, configureLLMTiers } from '../llm/config-binding.ts';
+import { effectiveLlmForBinding } from './usejarvis-ai.ts';
+
+/** Wrap a turn's stream so the in-flight count is released when it settles
+ *  (exhausted, errored, or the consumer breaks). `endTurn` is idempotent. */
+async function* trackTurnStream(
+  inner: AsyncIterable<LLMStreamEvent>,
+  endTurn: () => void,
+): AsyncGenerator<LLMStreamEvent> {
+  try {
+    yield* inner;
+  } finally {
+    endTurn();
+  }
+}
+import { getDb } from '../vault/schema.ts';
 import { AgentOrchestrator } from '../agents/orchestrator.ts';
 import { loadRole } from '../roles/loader.ts';
 import { ToolRegistry } from '../actions/tools/registry.ts';
@@ -34,7 +43,7 @@ import { researchQueueTool } from '../actions/tools/research.ts';
 import { documentTool } from '../actions/tools/documents.ts';
 import { AgentTaskManager } from '../agents/task-manager.ts';
 import { discoverSpecialists, formatSpecialistList } from '../agents/role-discovery.ts';
-import { buildSystemPrompt, type PromptContext } from '../roles/prompt-builder.ts';
+import { buildSystemPromptParts, type PromptContext, type SystemPromptParts } from '../roles/prompt-builder.ts';
 import type { ProgressCallback } from '../agents/sub-agent-runner.ts';
 import {
   getPersonality,
@@ -56,11 +65,16 @@ import { extractAndStore } from '../vault/extractor.ts';
 import { getKnowledgeForMessage } from '../vault/retrieval.ts';
 import { formatUserProfileForPrompt } from '../user/profile.ts';
 import { getUserProfile } from '../vault/user-profile.ts';
-import { getWebappInstructionsForMessage } from '../vault/webapp-templates.ts';
 import type { ResearchQueue } from './research-queue.ts';
 import type { IAgentService } from './agent-service-interface.ts';
 import type { AuthorityEngine } from '../authority/engine.ts';
 import { getSidecarManager } from '../actions/tools/sidecar-route.ts';
+import { ConvOrchestrator } from '../agents/conv/conv-orchestrator.ts';
+import { TaskRegistry } from '../agents/conv/task-registry.ts';
+import { TaskDispatcher } from '../agents/conv/task-dispatcher.ts';
+import { DialogueCompactor } from '../agents/conv/dialogue-compactor.ts';
+import type { ConvTaskEvent } from '../agents/conv/conv-orchestrator.ts';
+import { getRecentConversation, getMessages } from '../vault/conversations.ts';
 
 export class AgentService implements Service, IAgentService {
   name = 'agent';
@@ -77,6 +91,13 @@ export class AgentService implements Service, IAgentService {
   private researchQueue: ResearchQueue | null = null;
   private taskManager: AgentTaskManager | null = null;
   private authorityEngine: AuthorityEngine | null = null;
+  // Phase 4: conv-tier infrastructure. Constructed lazily when the
+  // conversation tier is configured. Null in classic single-orchestrator mode.
+  private taskRegistry: TaskRegistry | null = null;
+  private taskDispatcher: TaskDispatcher | null = null;
+  private convOrchestrator: ConvOrchestrator | null = null;
+  private convTaskEventListener: ((event: ConvTaskEvent) => void) | null = null;
+  private dialogueCompactor: DialogueCompactor | null = null;
 
   constructor(config: JarvisConfig) {
     this.config = config;
@@ -254,14 +275,40 @@ export class AgentService implements Service, IAgentService {
 
   /**
    * Stream a message through the agent. Returns a stream and an onComplete callback.
+   *
+   * Routing mirrors handleMessage(): if a conversation tier is configured, we
+   * run the router-first conv orchestrator and wrap its (non-streaming)
+   * result in a single text + done event so the WebSocket UI keeps working.
+   * Token-level streaming through the conv path is a Phase 6 follow-up.
    */
   streamMessage(text: string, channel: string = 'websocket', siteContext?: string): {
     stream: AsyncIterable<LLMStreamEvent>;
     onComplete: (fullText: string) => Promise<void>;
   } {
-    let systemPrompt = this.buildFullSystemPrompt(channel, text);
+    // Refuse new turns once draining; otherwise count this one in-flight so a
+    // graceful drain can await it (released when the tracked stream settles).
+    if (activeTurns.isDraining) throw new DrainingError();
+    const endTurn = activeTurns.begin();
+    try {
+      const inner = this.streamMessageInner(text, channel, siteContext);
+      return { stream: trackTurnStream(inner.stream, endTurn), onComplete: inner.onComplete };
+    } catch (err) {
+      endTurn();
+      throw err;
+    }
+  }
+
+  private streamMessageInner(text: string, channel: string = 'websocket', siteContext?: string): {
+    stream: AsyncIterable<LLMStreamEvent>;
+    onComplete: (fullText: string) => Promise<void>;
+  } {
+    if (this.convOrchestrator) {
+      return this.streamMessageConv(text, channel);
+    }
+
+    const systemPrompt = this.buildFullSystemPromptParts(channel, text);
     if (siteContext) {
-      systemPrompt += '\n\n' + siteContext;
+      systemPrompt.dynamic += '\n\n' + siteContext;
     }
 
     const stream = this.orchestrator.streamMessage(systemPrompt, text);
@@ -283,176 +330,397 @@ export class AgentService implements Service, IAgentService {
   }
 
   /**
-   * Non-streaming message handler. Returns full response string.
+   * Stream path for router-first conv mode. Relays the ConvOrchestrator's
+   * streaming events to the UI: acknowledgment text appears immediately when
+   * the conv LLM emits it alongside a delegate tool call, then the task tier
+   * runs (during which we surface task lifecycle events via the listener),
+   * then the final verbalization text appears.
    */
-  async handleMessage(text: string, channel: string = 'websocket'): Promise<string> {
-    const systemPrompt = this.buildFullSystemPrompt(channel, text);
+  private streamMessageConv(text: string, channel: string): {
+    stream: AsyncIterable<LLMStreamEvent>;
+    onComplete: (fullText: string) => Promise<void>;
+  } {
+    const self = this;
+    const stream = (async function* (): AsyncGenerator<LLMStreamEvent> {
+      if (!self.convOrchestrator) {
+        yield { type: 'error', error: 'Conv orchestrator not initialized' };
+        return;
+      }
+      let fullText = '';
+      try {
+        const identity = self.buildUserIdentityBlock();
+        const userProfile = self.buildUserProfileBlock();
+        const recentDialogue = await self.loadRecentDialogue(channel);
+        const ambient = self.buildAmbientFactsBlock(text);
 
-    const response = await this.orchestrator.processMessage(systemPrompt, text);
+        // Task lifecycle events go through the listener IN REAL TIME (during
+        // the dispatcher's await), independent of the text stream. The
+        // generator below yields only text/done events.
+        const taskListener = self.convTaskEventListener ?? undefined;
 
-    // Run extraction and learning in parallel (non-blocking but tracked)
-    Promise.allSettled([
-      this.extractKnowledge(text, response).catch((err) =>
-        console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
-      ),
-      this.learnFromInteraction(text, response, channel).catch((err) =>
-        console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
-      ),
-    ]);
+        for await (const event of self.convOrchestrator.streamTurn(text, {
+          userIdentity: identity,
+          userProfile,
+          recentDialogue,
+          ambientFacts: ambient,
+        }, taskListener)) {
+          if (event.type === 'text') {
+            // Insert a separator so the acknowledgment text doesn't blur into
+            // the later verbalization on the client side.
+            const separator = event.newSegment && fullText && !fullText.endsWith('\n') ? '\n\n' : '';
+            const chunk = separator + event.text;
+            fullText += chunk;
+            // A segmentEnd-only event has no text; forward the signal so TTS
+            // can speak the finished acknowledgment without waiting.
+            yield { type: 'text', text: chunk, segmentEnd: event.segmentEnd };
+          }
+          // 'done' is implicit - the generator ends.
+        }
 
-    return response;
+        yield {
+          type: 'done',
+          response: {
+            content: fullText,
+            tool_calls: [],
+            usage: { input_tokens: 0, output_tokens: 0 },
+            model: 'conv',
+            finish_reason: 'stop',
+          },
+        };
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        const code = err && typeof err === 'object'
+          ? (err as { code?: LLMErrorCode }).code
+          : undefined;
+        console.error('[AgentService] Conv stream error:', errorMsg);
+        yield { type: 'error', error: errorMsg, code };
+      }
+    })();
+
+    const onComplete = async (fullText: string): Promise<void> => {
+      await Promise.allSettled([
+        this.extractKnowledge(text, fullText).catch((err) =>
+          console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
+        ),
+        this.learnFromInteraction(text, fullText, channel).catch((err) =>
+          console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
+        ),
+      ]);
+    };
+
+    return { stream, onComplete };
   }
 
   /**
-   * Handle periodic heartbeat with full tool access.
-   * Accepts optional coalesced event summary to include in the prompt.
-   * Uses processMessage() so the agent can take action (browse, run commands, etc.).
+   * Multi-modal stream — same as streamMessage but the user message
+   * carries both an inline base64 image (e.g. a region screenshot
+   * captured by the pebble) and the user's text. Used by T19's
+   * "help with this" flow.
+   *
+   * NOTE: unlike streamMessage, this always uses the base primary agent and
+   * does NOT route through convOrchestrator when conv (router-first) mode is
+   * active — the conv path doesn't carry vision. Consequence: in conv mode,
+   * image turns run through a different agent than text turns, and the conv
+   * text stream's tool_call events (which drive the pebble's action narration)
+   * won't fire for image turns. Intentional for now; revisit if conv gains
+   * vision support.
    */
-  async handleHeartbeat(coalescedEvents?: string): Promise<string | null> {
-    if (!this.role) return null;
-
-    const systemPrompt = this.buildHeartbeatPrompt(coalescedEvents);
-
-    // Build the heartbeat "user message" that triggers the agent
-    const parts: string[] = ['[HEARTBEAT] Periodic check-in. Review your responsibilities and take action.'];
-
-    if (coalescedEvents) {
-      parts.push('');
-      parts.push(coalescedEvents);
-    }
-
-    const heartbeatMessage = parts.join('\n');
-
+  streamMessageWithImage(
+    text: string,
+    imageBase64: string,
+    mediaType: string,
+    channel: string = 'websocket',
+    siteContext?: string,
+  ): {
+    stream: AsyncIterable<LLMStreamEvent>;
+    onComplete: (fullText: string) => Promise<void>;
+  } {
+    // Same drain gate + in-flight tracking as streamMessage (the pebble image
+    // turn is a real turn — must not start mid-drain or run uncounted).
+    if (activeTurns.isDraining) throw new DrainingError();
+    const endTurn = activeTurns.begin();
     try {
-      const response = await this.orchestrator.processMessage(systemPrompt, heartbeatMessage);
-      if (response && response.trim().length > 0) {
-        return response;
-      }
-      return null;
+      const systemPrompt = this.buildFullSystemPromptParts(channel, text);
+      if (siteContext) systemPrompt.dynamic += '\n\n' + siteContext;
+
+      const content: import('../llm/provider.ts').ContentBlock[] = [
+        { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
+        { type: 'text', text },
+      ];
+      const stream = this.orchestrator.streamMessage(systemPrompt, content);
+
+      const onComplete = async (fullText: string): Promise<void> => {
+        await Promise.allSettled([
+          this.extractKnowledge(text, fullText).catch((err) =>
+            console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
+          ),
+          this.learnFromInteraction(text, fullText, channel).catch((err) =>
+            console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
+          ),
+        ]);
+      };
+
+      return { stream: trackTurnStream(stream, endTurn), onComplete };
     } catch (err) {
-      console.error('[AgentService] Heartbeat processing error:', err);
-      return null;
+      endTurn();
+      throw err;
     }
+  }
+
+  /**
+   * Non-streaming message handler. Returns full response string.
+   *
+   * Routing:
+   *   - If `llm.tiers.conversation` is configured AND the ConvOrchestrator has
+   *     been initialized, the router-first path runs: the conv LLM owns
+   *     dialogue and emits delegate() tool calls that drive task tiers.
+   *   - Otherwise the classic orchestrator runs (full role prompt, all tools,
+   *     ReAct loop on the medium tier).
+   */
+  async handleMessage(text: string, channel: string = 'websocket'): Promise<string> {
+    // Non-streaming turn entry (external channels, etc). Background reactions go
+    // through BackgroundAgentService.handleMessage, which is gated separately.
+    if (activeTurns.isDraining) throw new DrainingError();
+    const endTurn = activeTurns.begin();
+    try {
+      let response: string;
+
+      if (this.convOrchestrator) {
+        response = await this.handleMessageConv(text, channel);
+      } else {
+        const systemPrompt = this.buildFullSystemPromptParts(channel, text);
+        response = await this.orchestrator.processMessage(systemPrompt, text);
+      }
+
+      // Run extraction and learning in parallel (non-blocking but tracked)
+      Promise.allSettled([
+        this.extractKnowledge(text, response).catch((err) =>
+          console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
+        ),
+        this.learnFromInteraction(text, response, channel).catch((err) =>
+          console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
+        ),
+      ]);
+
+      return response;
+    } finally {
+      endTurn();
+    }
+  }
+
+  /**
+   * Router-first message handler. Builds a tight conv-tier context (user
+   * identity + recent dialogue) and lets the conv LLM decide whether to
+   * delegate or answer directly.
+   */
+  private async handleMessageConv(text: string, channel: string = 'websocket'): Promise<string> {
+    if (!this.convOrchestrator) {
+      // Should be unreachable - caller checks this.convOrchestrator first.
+      throw new Error('Conv orchestrator not initialized');
+    }
+    const identity = this.buildUserIdentityBlock();
+    const recentDialogue = await this.loadRecentDialogue(channel);
+    const result = await this.convOrchestrator.processTurn(
+      text,
+      {
+        userIdentity: identity,
+        userProfile: this.buildUserProfileBlock(),
+        recentDialogue,
+        ambientFacts: this.buildAmbientFactsBlock(text),
+      },
+      this.convTaskEventListener ?? undefined,
+    );
+    return result.text;
+  }
+
+  /**
+   * Pull recent messages from the persistent conversation for the conv LLM.
+   * When the conversation is long, the DialogueCompactor condenses old turns
+   * into a summary system message and keeps the most-recent N verbatim. This
+   * keeps the conv-tier context budget tight without losing continuity.
+   */
+  private async loadRecentDialogue(channel: string): Promise<LLMMessage[]> {
+    try {
+      const recent = getRecentConversation(channel);
+      if (!recent) return [];
+      // Pull a wider window than we'll inject so the compactor has material
+      // to summarize when the conversation is long. The compactor caps the
+      // final list size (last 20 verbatim by default; older bucketed into a
+      // background-built summary when conversation exceeds 40 messages).
+      const messages = getMessages(recent.conversation.id, { limit: 80 });
+      const dialogue: LLMMessage[] = messages
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        .map(m => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content,
+        }));
+
+      if (!this.dialogueCompactor) return dialogue.slice(-10);
+      return await this.dialogueCompactor.compact(recent.conversation.id, dialogue);
+    } catch (err) {
+      console.warn('[AgentService] Failed to load recent dialogue:', err);
+      return [];
+    }
+  }
+
+  /** One-line identity facts the conv LLM sees in every turn. */
+  private buildUserIdentityBlock(): string {
+    const parts: string[] = [];
+    const name = this.config.user?.name;
+    if (name) parts.push(`Name: ${name}`);
+    parts.push(`Local time: ${new Date().toLocaleString()}`);
+    return parts.join('. ');
+  }
+
+  /**
+   * Full user profile (wizard answers + interview facts) for the conv LLM,
+   * giving it the same rich context about the user that the classic path
+   * injects via buildPromptContext -> formatUserProfileForPrompt. Rendered
+   * as its own cache-marked system block, so it stays out of the volatile
+   * identity line - keep anything that changes per turn out of here.
+   */
+  private buildUserProfileBlock(): string | undefined {
+    try {
+      const profile = getUserProfile();
+      const profileContext = formatUserProfileForPrompt(profile);
+      if (!profileContext) return undefined;
+      return `# User Profile\n${profileContext}`;
+    } catch (err) {
+      console.warn('[AgentService] Error loading user profile for conv prompt:', err);
+      return undefined;
+    }
+  }
+
+  /**
+   * Compact ambient state for the conv LLM: knowledge graph facts relevant to
+   * the current message + a tiny commitment summary. The vault retrieval is
+   * already entity-match-driven so it stays empty when the message doesn't
+   * mention anything we remember (zero-cost on small-talk turns).
+   */
+  private buildAmbientFactsBlock(text: string): string {
+    const parts: string[] = [];
+    try {
+      const knowledge = getKnowledgeForMessage(text);
+      if (knowledge && knowledge.trim().length > 0) {
+        parts.push('Relevant knowledge about entities in this message:');
+        parts.push(knowledge);
+      }
+    } catch (err) {
+      console.warn('[AgentService] Failed to retrieve conv ambient knowledge:', err);
+    }
+    return parts.join('\n');
+  }
+
+  /**
+   * Wire a listener for task lifecycle events emitted by the conv orchestrator.
+   * The daemon's WS service uses this to surface status pills in the UI.
+   */
+  setConvTaskEventListener(listener: (event: ConvTaskEvent) => void): void {
+    this.convTaskEventListener = listener;
+  }
+
+  /**
+   * Expose the task registry for diagnostics / API endpoints. Null when
+   * running in classic mode.
+   */
+  getTaskRegistry(): TaskRegistry | null {
+    return this.taskRegistry;
   }
 
   // --- Private methods ---
 
   private registerProviders(): void {
-    const { llm } = this.config;
-    let hasProvider = false;
-
-    // Register Anthropic
-    if (llm.anthropic?.api_key) {
-      const provider = new AnthropicProvider(
-        llm.anthropic.api_key,
-        llm.anthropic.model
-      );
-      this.llmManager.registerProvider(provider);
-      hasProvider = true;
-      console.log('[AgentService] Registered Anthropic provider');
-    }
-
-    // Register OpenAI
-    if (llm.openai?.api_key) {
-      const provider = new OpenAIProvider(
-        llm.openai.api_key,
-        llm.openai.model
-      );
-      this.llmManager.registerProvider(provider);
-      hasProvider = true;
-      console.log('[AgentService] Registered OpenAI provider');
-    }
-
-    // Register Groq
-    if (llm.groq?.api_key) {
-      const provider = new GroqProvider(
-        llm.groq.api_key,
-        llm.groq.model
-      );
-      this.llmManager.registerProvider(provider);
-      hasProvider = true;
-      console.log('[AgentService] Registered Groq provider');
-    }
-
-    // Register Gemini
-    if (llm.gemini?.api_key) {
-      const provider = new GeminiProvider(
-        llm.gemini.api_key,
-        llm.gemini.model
-      );
-      this.llmManager.registerProvider(provider);
-      hasProvider = true;
-      console.log('[AgentService] Registered Gemini provider');
-    }
-
-    // Register OpenRouter
-    if (llm.openrouter?.api_key) {
-      const provider = new OpenRouterProvider(
-        llm.openrouter.api_key,
-        llm.openrouter.model
-      );
-      this.llmManager.registerProvider(provider);
-      hasProvider = true;
-      console.log('[AgentService] Registered OpenRouter provider');
-    }
-
-    // Register NVIDIA
-    if (llm.nvidia?.api_key) {
-      const provider = new NVIDIAProvider(
-        llm.nvidia.api_key,
-        llm.nvidia.model
-      );
-      this.llmManager.registerProvider(provider);
-      hasProvider = true;
-      console.log('[AgentService] Registered NVIDIA provider');
-    }
-
-    // Register Ollama only when the user has explicitly set a base_url.
-    // Defaulting to localhost:11434 makes the provider appear active even
-    // when no Ollama server is running, so we require an opt-in URL.
-    if (llm.ollama?.base_url) {
-      const provider = new OllamaProvider(
-        llm.ollama.base_url,
-        llm.ollama.model
-      );
-      this.llmManager.registerProvider(provider);
-      hasProvider = true;
-      console.log('[AgentService] Registered Ollama provider');
-    }
-
-    // Register OpenAI-compatible (llama.cpp, vLLM, LM Studio, etc.).
-    // Needs an explicit base_url; api_key is optional.
-    if (llm.openai_compatible?.base_url) {
-      const provider = new OpenAICompatibleProvider(
-        llm.openai_compatible.base_url,
-        llm.openai_compatible.model,
-        llm.openai_compatible.api_key,
-      );
-      this.llmManager.registerProvider(provider);
-      hasProvider = true;
-      console.log('[AgentService] Registered OpenAI-compatible provider');
-    }
+    // Bind through the effective view: hosted tier defaults live only in this
+    // per-bind copy (explicit ref → llm.default → plan alias), never in
+    // config.llm, so they can never leak into a persistence path.
+    const llm = effectiveLlmForBinding(this.config);
+    const hasProvider = registerLLMProviders(this.llmManager, llm.providers ?? {}, {
+      promptCache: llm.prompt_cache !== false,
+    });
 
     if (!hasProvider) {
       console.warn('[AgentService] No LLM providers configured. Responses will be placeholders.');
     }
 
-    // Set primary and fallback chain
     if (hasProvider) {
-      try {
-        this.llmManager.setPrimary(llm.primary);
-      } catch {
-        // Primary provider not available, first registered is already primary
-      }
-
-      // Set fallback chain (only for providers that were registered)
-      const registeredFallbacks = llm.fallback.filter(
-        (name) => this.llmManager.getProvider(name) !== undefined
-      );
-      if (registeredFallbacks.length > 0) {
-        this.llmManager.setFallbackChain(registeredFallbacks);
-      }
+      configureLLMTiers(this.llmManager, llm);
     }
+
+    // Phase 4: initialize conv-tier infrastructure ONLY when the user has
+    // configured llm.tiers.conversation. Otherwise we stay in classic
+    // single-orchestrator mode (and handleMessage uses this.orchestrator).
+    if (this.llmManager.hasConversationTier()) {
+      // Persist task records so paused (needs_input) tasks survive daemon
+      // restarts. getDb is called lazily (resolver function) so a DB re-open
+      // between hot-reloads stays consistent. hydrate() runs immediately to
+      // reconcile any tasks that were in-flight at shutdown.
+      this.taskRegistry = new TaskRegistry({ db: () => { try { return getDb(); } catch { return null; } } });
+      this.taskRegistry.hydrate();
+      // Task runner: route delegations through the primary orchestrator so
+      // task tiers run with the full tool registry, role prompt, authority
+      // gating, and Jarvis-specific feature knowledge. Uses processTaskCall
+      // (not processMessage) so the LLM has access to the
+      // `ask_for_clarification` tool for pause/resume and the conversation
+      // buffer is scoped to one task (not polluting the primary agent's
+      // global history).
+      const runner: import('../agents/conv/task-dispatcher.ts').TaskRunner = async ({
+        tier,
+        subsystem,
+        template,
+        intent,
+        originalMessage,
+        signal,
+        history,
+      }) => {
+        const baseSystem = this.buildFullSystemPromptParts('conv', originalMessage);
+        const templateNote = TaskDispatcher.templatePromptFor(template);
+        // Attach the conv LLM's routing intent as system context so the task
+        // tier sees both the user's verbatim ask AND the conv's framing -
+        // but the user's words are the primary signal. Both are per-task
+        // volatile, so they ride on the dynamic half of the prompt.
+        const systemPrompt: SystemPromptParts = {
+          static: baseSystem.static,
+          dynamic: `${baseSystem.dynamic}\n\n${templateNote}\n\nConversation routing note: ${intent}`,
+        };
+        const result = await this.orchestrator.processTaskCall({
+          systemPrompt,
+          userMessage: originalMessage,
+          tier,
+          subsystem,
+          history: history as import('../llm/provider.ts').LLMMessage[] | undefined,
+          signal,
+        });
+        return result;
+      };
+      this.taskDispatcher = new TaskDispatcher(this.llmManager, this.taskRegistry, runner);
+      this.dialogueCompactor = new DialogueCompactor(this.llmManager);
+      const persona = this.buildPersona();
+      this.convOrchestrator = new ConvOrchestrator(
+        this.llmManager,
+        this.taskRegistry,
+        this.taskDispatcher,
+        persona,
+      );
+      console.log('[AgentService] Conversation tier configured - router-first mode active.');
+    } else {
+      console.log('[AgentService] No conversation tier - classic orchestrator mode.');
+    }
+  }
+
+  /**
+   * Build the conversation persona string injected into the conv-tier system
+   * prompt. Reads from `config.personality` so users can customize tone
+   * without touching code.
+   */
+  private buildPersona(): string {
+    const p = this.config.personality;
+    const traits = (p?.core_traits ?? []).join(', ');
+    const name = p?.assistant_name ?? 'JARVIS';
+    return [
+      `You are ${name}, the user's conversational assistant.`,
+      traits ? `Core traits: ${traits}.` : '',
+      'Be concise, natural, and direct. Anticipate needs without being intrusive.',
+    ].filter(Boolean).join(' ');
   }
 
   private loadActiveRole(): RoleDefinition {
@@ -486,65 +754,91 @@ export class AgentService implements Service, IAgentService {
     );
   }
 
-  private buildFullSystemPrompt(channel: string, userMessage?: string): string {
-    if (!this.role) return '';
+  /**
+   * Build the full system prompt used by chat turns. Public so other code
+   * paths (workflow's `jarvis-ask` piece, etc.) can give the LLM the same
+   * Jarvis identity + role + personality + vault context that chat gets.
+   *
+   * `channel` selects channel-specific personality overrides (telegram,
+   * discord, etc.); unknown channel names fall back to the default
+   * personality.
+   *
+   * `userMessage` is optional -- when provided we pull message-relevant
+   * knowledge / webapp instructions from the vault to inject into the
+   * prompt. Pass it for "the user said X" turns; omit for heartbeats.
+   */
+  /**
+   * Lean system prompt for premium realtime voice (gpt-realtime-2).
+   *
+   * The full agent prompt is ~5.6k tokens and, with ~32 tool definitions
+   * (~3.4k tokens), made the realtime model digest ~10k tokens of context
+   * before EVERY spoken reply — the dominant per-turn latency (a simple "how
+   * are you" took 1–2s). The realtime model is built for a concise,
+   * conversational prompt, so here we give it just identity + tone + a
+   * live-voice framing (~100 tokens). Tools stay available, so JARVIS can still
+   * act; we only drop the heavyweight role/KPI/commitments/vault context that a
+   * spoken chat doesn't need. This is removal of bloat, NOT a behavioral
+   * directive (no "be brief / don't narrate" — those suppressed preambles and
+   * made it deliberate).
+   */
+  buildRealtimeVoiceInstructions(): string {
+    const name = this.config.personality?.assistant_name?.trim() || this.role?.name || 'JARVIS';
+    const userName = this.config.user?.name?.trim() || getUserProfile()?.answers.preferred_name?.trim();
+    const traits = (this.config.personality?.core_traits ?? []).slice(0, 6).join(', ');
+    return [
+      `You are ${name}${userName ? `, ${userName}'s personal AI assistant` : ', a personal AI assistant'}, in a live, real-time voice conversation.`,
+      'Speak naturally and conversationally, the way a person talks out loud.',
+      traits ? `Your character: ${traits}.` : '',
+      'You can take real actions with your tools whenever the user asks.',
+      `Current time: ${new Date().toISOString()}.`,
+    ].filter(Boolean).join('\n');
+  }
 
-    // Build prompt context with live data + vault knowledge
-    const context = this.buildPromptContext(userMessage);
+  buildFullSystemPrompt(channel: string, userMessage?: string): string {
+    const parts = this.buildFullSystemPromptParts(channel, userMessage);
+    if (!parts.static && !parts.dynamic) return '';
+    return parts.dynamic ? `${parts.static}\n\n${parts.dynamic}` : parts.static;
+  }
 
-    // Build base system prompt from role + context
-    const rolePrompt = buildSystemPrompt(this.role, context);
+  /**
+   * System prompt split at the prompt-cache boundary: `static` is byte-stable
+   * turn-over-turn for a given channel (role prompt + channel personality),
+   * `dynamic` carries the per-turn context (time, observations, goals, ...).
+   * Callers hand the parts to the orchestrator, which marks the static half
+   * as a provider cache boundary.
+   */
+  buildFullSystemPromptParts(channel: string, userMessage?: string): SystemPromptParts {
+    if (!this.role) return { static: '', dynamic: '' };
 
-    // Build personality prompt for this channel
+    // Build prompt context with live data + vault knowledge.
+    // For latency-sensitive voice channels (pebble), build a slimmer
+    // context: skip observations / content pipeline / commitments since
+    // conversational voice queries rarely benefit from them and the
+    // extra prompt tokens slow first-token-out by hundreds of ms.
+    const context = channel === 'pebble'
+      ? this.buildPromptContext(userMessage, { slim: true })
+      : this.buildPromptContext(userMessage);
+
+    // Build base system prompt from role + context, split at the boundary
+    const roleParts = buildSystemPromptParts(this.role, context);
+
+    // Build personality prompt for this channel. Config-derived and
+    // time-invariant, so it belongs to the static (cacheable) half.
     const personality = this.personality ?? getPersonality();
     const channelPersonality = getChannelPersonality(personality, channel);
     const personalityPrompt = personalityToPrompt(channelPersonality);
 
-    return `${rolePrompt}\n\n${personalityPrompt}`;
+    return {
+      static: `${roleParts.static}\n\n${personalityPrompt}`,
+      dynamic: roleParts.dynamic,
+    };
   }
 
-  private buildHeartbeatPrompt(coalescedEvents?: string): string {
-    if (!this.role) return '';
-
-    const context = this.buildPromptContext();
-    const rolePrompt = buildSystemPrompt(this.role, context);
-
-    const parts = [rolePrompt, '', '# Heartbeat Check', this.role.heartbeat_instructions];
-
-    if (coalescedEvents) {
-      parts.push('', '# Recent System Events', coalescedEvents);
-    }
-
-    // Inject commitment execution instructions
-    parts.push('', '# COMMITMENT EXECUTION');
-    parts.push('If any commitments are overdue or due soon, EXECUTE them now using your tools.');
-    parts.push('Do not just mention them — actually perform the work. Use browse, terminal, file operations as needed.');
-
-    // Inject background research instructions when idle
-    if (this.researchQueue && this.researchQueue.queuedCount() > 0) {
-      const next = this.researchQueue.getNext();
-      if (next) {
-        parts.push('', '# BACKGROUND RESEARCH');
-        parts.push(`You have a research topic queued: "${next.topic}"`);
-        parts.push(`Reason: ${next.reason}`);
-        parts.push(`Research ID: ${next.id}`);
-        parts.push('If nothing urgent needs your attention, research this topic now.');
-        parts.push('Use your browser and tools to gather information, then use the research_queue tool with action "complete" to save your findings.');
-      }
-    } else {
-      parts.push('', '# IDLE MODE');
-      parts.push('No research topics queued. If nothing urgent, you may:');
-      parts.push('- Check news or trends relevant to the user');
-      parts.push('- Review and organize pending tasks');
-      parts.push('- Or simply report "All clear" if nothing needs attention');
-    }
-
-    parts.push('', '# Important', 'You have full tool access during this heartbeat. If you need to take action (browse the web, run commands, check files), DO IT. Be proactive and aggressive about helping.');
-
-    return parts.join('\n');
-  }
-
-  private buildPromptContext(userMessage?: string): PromptContext {
+  private buildPromptContext(userMessage?: string, opts?: { slim?: boolean }): PromptContext {
+    // Slim mode: voice channels skip the heavyweight context blocks
+    // (observations, content pipeline, commitments) so the LLM has
+    // hundreds fewer prompt tokens to chew through before first response.
+    const slim = opts?.slim === true;
     // Check if any sidecars are enrolled (cheap DB query, controls tool guide content)
     let hasSidecars = false;
     try {
@@ -584,38 +878,30 @@ export class AgentService implements Service, IAgentService {
       } catch (err) {
         console.error('[AgentService] Error retrieving knowledge:', err);
       }
+    }
 
-      // Retrieve webapp-specific browser instructions if message mentions a known app
+    // Get due commitments — skipped in slim/voice mode.
+    if (!slim) {
       try {
-        const webappInstructions = getWebappInstructionsForMessage(userMessage);
-        if (webappInstructions) {
-          context.webappInstructions = webappInstructions;
+        const due = getDueCommitments();
+        const upcoming = getUpcoming(5);
+        const allCommitments = [...due, ...upcoming];
+
+        if (allCommitments.length > 0) {
+          context.activeCommitments = allCommitments.map((c) => {
+            const dueStr = c.when_due
+              ? ` (due: ${new Date(c.when_due).toLocaleString()})`
+              : '';
+            return `[${c.priority}] ${c.what}${dueStr} — ${c.status}`;
+          });
         }
       } catch (err) {
-        console.error('[AgentService] Error retrieving webapp instructions:', err);
+        console.error('[AgentService] Error loading commitments:', err);
       }
     }
 
-    // Get due commitments
-    try {
-      const due = getDueCommitments();
-      const upcoming = getUpcoming(5);
-      const allCommitments = [...due, ...upcoming];
-
-      if (allCommitments.length > 0) {
-        context.activeCommitments = allCommitments.map((c) => {
-          const dueStr = c.when_due
-            ? ` (due: ${new Date(c.when_due).toLocaleString()})`
-            : '';
-          return `[${c.priority}] ${c.what}${dueStr} — ${c.status}`;
-        });
-      }
-    } catch (err) {
-      console.error('[AgentService] Error loading commitments:', err);
-    }
-
-    // Get active content pipeline items (not published)
-    try {
+    // Get active content pipeline items (not published) — skipped in slim/voice mode.
+    if (!slim) try {
       const activeContent = findContent({}).filter(
         (c) => c.stage !== 'published'
       ).slice(0, 10);
@@ -629,8 +915,8 @@ export class AgentService implements Service, IAgentService {
       console.error('[AgentService] Error loading content pipeline:', err);
     }
 
-    // Get recent observations
-    try {
+    // Get recent observations — skipped in slim/voice mode.
+    if (!slim) try {
       const observations = getRecentObservations(undefined, 10);
       if (observations.length > 0) {
         context.recentObservations = observations.map((o) => {
@@ -671,12 +957,9 @@ export class AgentService implements Service, IAgentService {
   }
 
   private async extractKnowledge(userMessage: string, assistantResponse: string): Promise<void> {
-    // Get the primary provider for extraction
-    const provider = this.llmManager.getProvider(this.config.llm.primary)
-      ?? this.llmManager.getProvider('anthropic')
-      ?? this.llmManager.getProvider('openai');
-
-    await extractAndStore(userMessage, assistantResponse, provider);
+    // The extractor uses the `low` tier internally - it's structured
+    // extraction work that doesn't need the conversation model's smarts.
+    await extractAndStore(userMessage, assistantResponse, this.llmManager);
   }
 
   private async learnFromInteraction(

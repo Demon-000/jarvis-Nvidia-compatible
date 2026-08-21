@@ -9,6 +9,7 @@ const ROOM_TITLE: Record<RoomKey, string> = {
   memory: "Memory",
   tools: "Tools",
   agents: "Agents",
+  agent_strip: "Agent Strip",
   authority: "Authority",
   logs: "Logs",
   calendar: "Calendar",
@@ -16,6 +17,7 @@ const ROOM_TITLE: Record<RoomKey, string> = {
   tasks: "Tasks",
   content: "Content",
   workspaces: "Workspaces",
+  usage: "Usage",
   settings: "Settings",
 };
 

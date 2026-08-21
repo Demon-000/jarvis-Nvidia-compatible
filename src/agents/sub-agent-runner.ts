@@ -21,11 +21,32 @@ import { getActionForTool } from '../authority/tool-action-map.ts';
 const MAX_TOOL_ITERATIONS = 100; // Lower than primary's 200 — sub-agents should be focused
 const MAX_TOOL_RESULT_CHARS = 6000;
 
+/**
+ * Why the loop ended. `completed` is the happy path (LLM stopped requesting
+ * tools). `max_iterations` means we exhausted the iteration cap with the
+ * model still asking for tools -- callers should treat the answer as
+ * partial. `error` is set when an exception escaped the loop. Surfacing
+ * this lets workflow callers (jarvis-agent.delegate) map directly to the
+ * piece's `{completed | max_iterations | error}` status field instead of
+ * inferring from `success` + `response`.
+ */
+export type SubAgentTerminationReason = 'completed' | 'max_iterations' | 'error';
+
 export type SubAgentResult = {
   success: boolean;
   response: string;
   toolsUsed: string[];
   tokensUsed: { input: number; output: number };
+  terminationReason: SubAgentTerminationReason;
+  /**
+   * Full message log of the sub-agent's run -- system prompt, the user task,
+   * every intermediate `assistant` message (with `tool_calls` when the LLM
+   * requested any), every `tool` result message, and the final assistant
+   * answer. Callers that need a tool-call trace (the workflow piece's
+   * `jarvis-agent.delegate`) walk this array instead of `agent.getMessages()`,
+   * which only sees the simple user/assistant turns. Returned even on error.
+   */
+  messages: LLMMessage[];
 };
 
 export type ProgressCallback = (event: {
@@ -53,10 +74,17 @@ export type RunSubAgentOptions = {
 /**
  * Build a system prompt for a sub-agent from its role definition.
  */
-function buildSubAgentPrompt(agent: AgentInstance, context: string): string {
+/**
+ * Sub-agent system prompt, split at the prompt-cache boundary. The static
+ * half depends only on the role, so across a sub-agent's loop iterations
+ * (and across runs of the same role within the cache TTL) the provider can
+ * serve tools + static prompt from cache. The per-task `context` rides on
+ * the dynamic half.
+ */
+function buildSubAgentPromptParts(agent: AgentInstance, context: string): { static: string; dynamic: string } {
   const role = agent.agent.role;
 
-  const parts = [
+  const staticParts = [
     `You are ${role.name}.`,
     '',
     role.description,
@@ -71,11 +99,10 @@ function buildSubAgentPrompt(agent: AgentInstance, context: string): string {
     '- Return a clear, structured result when done.',
   ];
 
-  if (context) {
-    parts.push('', '## Context', context);
-  }
-
-  return parts.join('\n');
+  return {
+    static: staticParts.join('\n'),
+    dynamic: context ? ['## Context', context].join('\n') : '',
+  };
 }
 
 /**
@@ -196,25 +223,27 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
   agent.setTask(task);
   agent.activate();
 
-  // Build system prompt
-  const systemPrompt = buildSubAgentPrompt(agent, context);
+  // Build system prompt (static half cache-marked, per-task context dynamic)
+  const systemPrompt = buildSubAgentPromptParts(agent, context);
 
   // Add the task as a user message
   agent.addMessage('user', task);
 
   // Build messages array
   const messages: LLMMessage[] = [
-    { role: 'system', content: systemPrompt },
+    { role: 'system', content: systemPrompt.static, cache: true },
+    ...(systemPrompt.dynamic ? [{ role: 'system', content: systemPrompt.dynamic } satisfies LLMMessage] : []),
     ...agent.getMessages(),
   ];
 
   const tools = getLLMTools(toolRegistry);
   let finalText = '';
+  let reachedFinal = false;
 
   try {
     // Tool execution loop
     for (let iteration = 0; iteration < maxIterations; iteration++) {
-      const llmResponse: LLMResponse = await llmManager.chat(messages, { tools });
+      const llmResponse: LLMResponse = await llmManager.chatTier('medium', 'sub_agent', messages, { tools });
 
       totalUsage.input += llmResponse.usage.input_tokens;
       totalUsage.output += llmResponse.usage.output_tokens;
@@ -261,6 +290,7 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
 
       // No tool calls — this is the final response
       finalText = llmResponse.content;
+      reachedFinal = true;
 
       if (onProgress) {
         onProgress({ type: 'text', agentName, agentId, data: finalText });
@@ -278,6 +308,8 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
       response: finalText,
       toolsUsed: [...new Set(toolsUsed)],
       tokensUsed: totalUsage,
+      terminationReason: reachedFinal ? 'completed' : 'max_iterations',
+      messages,
     };
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
@@ -288,6 +320,8 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
       response: `Sub-agent error: ${errorMsg}`,
       toolsUsed: [...new Set(toolsUsed)],
       tokensUsed: totalUsage,
+      terminationReason: 'error',
+      messages,
     };
   } finally {
     agent.idle();

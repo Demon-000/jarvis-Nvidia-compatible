@@ -19,12 +19,14 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Chip, Icon } from "../../ui";
+import { StatusChip, type Tone } from "../../ui/roomkit";
 import { RoomShell } from "../RoomShell";
 import { openRoom } from "../../router";
 import { useRoomActions } from "../useRoomActionBus";
 import { useRovingTabs } from "../useRovingTabs";
 import {
   useAgentsData,
+  useFullTaskResponse,
   type AgentRosterEntry,
   type SpecialistInfo,
 } from "./useAgentsData";
@@ -45,6 +47,13 @@ const ROLE_ICON: Record<string, LucideIcon> = {
   "marketing-strategist": Megaphone,
   "customer-support": Headphones,
 };
+
+/** 2-letter avatar from an agent name (agents §01 — "PA", "RA", "SE"). */
+function initials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0]![0]! + parts[1]![0]!).toUpperCase();
+  return (name.trim().slice(0, 2) || "··").toUpperCase();
+}
 
 type TabId = "command" | "orbital" | "builder";
 const AGENTS_TAB_KEYS: ReadonlyArray<TabId> = ["command", "orbital", "builder"];
@@ -340,18 +349,29 @@ function AgentCard({ agent }: { agent: AgentRosterEntry }) {
   const currentTask =
     agent.live?.current_task ?? agent.live?.latest_task?.task ?? null;
   const sinceTs = agent.live?.created_at ?? null;
+  const latestTask = agent.live?.latest_task ?? null;
+  // Show the finished task's answer once the agent is no longer busy —
+  // this is where the user actually reads what the sub-agent produced.
+  const finishedResult =
+    !agent.live?.busy && latestTask?.result ? latestTask.result : null;
+  // The roster poll caps long responses; fetch the full text only once
+  // the user actually expands the result.
+  const [resultOpen, setResultOpen] = useState(false);
+  const fullResponse = useFullTaskResponse(latestTask, resultOpen);
 
+  // Status remap (agents §01): primary is the one red accent in the room,
+  // active is BLUE (in-motion, not green), idle is neutral.
   let statusLabel: string;
-  let statusTone: "ok" | "warn" | "neutral" | "accent";
+  let statusTone: Tone;
   if (agent.isPrimary) {
     statusLabel = "Primary";
-    statusTone = "accent";
+    statusTone = "fail";
   } else if (agent.live?.busy) {
     statusLabel = "Active";
-    statusTone = "ok";
+    statusTone = "run";
   } else {
     statusLabel = "Idle";
-    statusTone = "neutral";
+    statusTone = "mut";
   }
 
   let timeLabel = "";
@@ -365,7 +385,7 @@ function AgentCard({ agent }: { agent: AgentRosterEntry }) {
     <article className="v2-agents__card" data-active={agent.isActive}>
       <div className="v2-agents__card-head">
         <div className="v2-agents__card-icon">
-          <Icon icon={IconComp} size="md" />
+          <span className="v2-agents__avatar-txt">{initials(agent.name)}</span>
         </div>
         <div className="v2-agents__card-id">
           <div className="v2-agents__card-name">{agent.name}</div>
@@ -373,10 +393,30 @@ function AgentCard({ agent }: { agent: AgentRosterEntry }) {
             {currentTask ?? "Waiting for tasks…"}
           </div>
         </div>
-        <Chip tone={statusTone} dot>
+        <StatusChip tone={statusTone} dot>
           {statusLabel}
-        </Chip>
+        </StatusChip>
       </div>
+      {finishedResult && (
+        <details
+          className="v2-agents__card-result"
+          onToggle={(e) => setResultOpen((e.target as HTMLDetailsElement).open)}
+        >
+          <summary className="v2-agents__card-result-summary">
+            <StatusChip tone={finishedResult.success ? "ok" : "hold"} dot>
+              {finishedResult.success ? "Result ready" : "Task failed"}
+            </StatusChip>
+            <span className="v2-agents__card-result-hint">
+              {latestTask?.completed_at
+                ? formatRelative(latestTask.completed_at)
+                : ""}
+            </span>
+          </summary>
+          <div className="v2-agents__card-result-body">
+            {fullResponse ?? finishedResult.response}
+          </div>
+        </details>
+      )}
       <div className="v2-agents__card-foot">
         <AuthorityBar authority={agent.authority} active={agent.isActive} />
         <div className="v2-agents__card-foot-spacer" />
@@ -419,6 +459,15 @@ function Orbital({
   const selected = selectedRoleId
     ? roster.find((a) => a.roleId === selectedRoleId) ?? null
     : null;
+  // The detail panel shows the result as soon as an agent is selected,
+  // so fetch the full text right away when the poll truncated it.
+  const selectedResultShown = Boolean(
+    selected && !selected.live?.busy && selected.live?.latest_task?.result,
+  );
+  const selectedFullResponse = useFullTaskResponse(
+    selected?.live?.latest_task,
+    selectedResultShown,
+  );
 
   // Ticker: most recent 20 events. Duplicated for seamless loop scroll.
   const tickerEvents = liveActivity.slice(0, 20);
@@ -473,7 +522,7 @@ function Orbital({
                   }
                   title={a.name}
                 >
-                  <Icon icon={IconComp} size="sm" />
+                  <span className="v2-agents__avatar-txt">{initials(a.name)}</span>
                   <span className="v2-agents__orb-name">{a.name}</span>
                 </button>
               );
@@ -485,13 +534,23 @@ function Orbital({
           <div className="v2-agents__orbital-detail">
             <div className="v2-agents__orbital-detail-head">
               <span className="v2-agents__orbital-detail-name">{selected.name}</span>
-              <Chip tone={selected.isActive ? "ok" : "neutral"} dot>
+              <StatusChip tone={selected.isActive ? "run" : "mut"} dot>
                 {selected.isPrimary ? "Primary" : selected.isActive ? "Active" : "Idle"}
-              </Chip>
+              </StatusChip>
             </div>
             {selected.live?.current_task && (
               <div className="v2-agents__orbital-detail-task">
                 {selected.live.current_task}
+              </div>
+            )}
+            {!selected.live?.busy && selected.live?.latest_task?.result && (
+              <div className="v2-agents__orbital-detail-result">
+                <div className="v2-agents__orbital-detail-result-label">
+                  {selected.live.latest_task.result.success
+                    ? "Latest result"
+                    : "Latest task failed"}
+                </div>
+                {selectedFullResponse ?? selected.live.latest_task.result.response}
               </div>
             )}
             <div className="v2-agents__orbital-detail-meta">

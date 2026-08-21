@@ -74,55 +74,54 @@ export async function runDoctor(): Promise<void> {
 
   // ── Check 4: LLM API Key ─────────────────────────────────────────
 
-  if (config) {
-    const primary = config.llm?.primary ?? 'anthropic';
-    const providerConfig = config.llm?.[primary];
+  // LLM config is owned by the DB + encrypted keychain (managed from the
+  // settings dashboard) - not config.yaml. Load it the same way the daemon
+  // does so the diagnostic reflects real runtime routing.
+  let llmConfig: any = null;
+  let llmProviderNames: string[] = [];
+  try {
+    const { loadConfig } = await import('../config/loader.ts');
+    const { initDatabase } = await import('../vault/schema.ts');
+    const { mergeLLMSettingsIntoConfig } = await import('../daemon/llm-settings.ts');
+    llmConfig = await loadConfig();
+    initDatabase(llmConfig.daemon.db_path);
+    mergeLLMSettingsIntoConfig(llmConfig, { persistMigrations: false });
+    llmProviderNames = Object.keys(llmConfig.llm.providers ?? {});
+  } catch (err) {
+    results.push({ name: 'LLM Provider', status: 'fail', message: `Could not load LLM settings: ${String(err).slice(0, 80)}` });
+  }
 
-    if (primary === 'ollama') {
-      results.push({ name: 'LLM Provider', status: 'ok', message: `ollama (${providerConfig?.model ?? 'llama3'})` });
-    } else if (providerConfig?.api_key && providerConfig.api_key !== '') {
-      results.push({
-        name: 'LLM Provider',
-        status: 'ok',
-        message: `${primary} (key: ${providerConfig.api_key.slice(0, 10)}...)`,
-      });
+  if (llmConfig) {
+    if (llmProviderNames.length === 0) {
+      results.push({ name: 'LLM Provider', status: 'fail', message: 'No providers configured. Add one in Settings > LLM (http://localhost:3142).' });
     } else {
-      results.push({ name: 'LLM Provider', status: 'fail', message: `${primary} API key not set` });
+      // The ROUTING view, not the persisted one: on a hosted install the
+      // uj-* tier defaults live only in the binding view (they are
+      // deliberately never written to config.llm, so silence stays silent).
+      // Reading config.llm.tiers directly would report "no model assigned"
+      // for an install that routes perfectly well.
+      const { effectiveLlmForBinding } = await import('../daemon/usejarvis-ai.ts');
+      const tiers = effectiveLlmForBinding(llmConfig).tiers ?? {};
+      const tierSummary = Object.entries(tiers).map(([t, v]) => `${t}=${v}`).join(', ');
+      const mode = tierSummary ? `tiers: ${tierSummary}` : (llmConfig.llm.default ? `default: ${llmConfig.llm.default}` : 'no model assigned');
+      results.push({ name: 'LLM Provider', status: 'ok', message: `${llmProviderNames.length} provider(s): ${llmProviderNames.join(', ')} (${mode})` });
     }
-  } else {
-    results.push({ name: 'LLM Provider', status: 'skip', message: 'No config file' });
   }
 
   // ── Check 5: LLM Connectivity ────────────────────────────────────
 
-  if (config) {
+  if (llmConfig && llmProviderNames.length > 0) {
     const spin = startSpinner('Testing LLM connectivity...');
     try {
-      const { LLMManager, AnthropicProvider, OpenAIProvider, GroqProvider, GeminiProvider, OllamaProvider, OpenRouterProvider, OpenAICompatibleProvider } = await import('../llm/index.ts');
+      const { LLMManager } = await import('../llm/index.ts');
+      const { registerLLMProviders, configureLLMTiers } = await import('../llm/config-binding.ts');
+      const { effectiveLlmForBinding } = await import('../daemon/usejarvis-ai.ts');
       const manager = new LLMManager();
-      const primary = config.llm?.primary ?? 'anthropic';
-
-      if (primary === 'anthropic' && config.llm?.anthropic?.api_key) {
-        manager.registerProvider(new AnthropicProvider(config.llm.anthropic.api_key, config.llm.anthropic.model));
-      } else if (primary === 'openai' && config.llm?.openai?.api_key) {
-        manager.registerProvider(new OpenAIProvider(config.llm.openai.api_key, config.llm.openai.model));
-      } else if (primary === 'groq' && config.llm?.groq?.api_key) {
-        manager.registerProvider(new GroqProvider(config.llm.groq.api_key, config.llm.groq.model));
-      } else if (primary === 'gemini' && config.llm?.gemini?.api_key) {
-        manager.registerProvider(new GeminiProvider(config.llm.gemini.api_key, config.llm.gemini.model));
-      } else if (primary === 'openrouter' && config.llm?.openrouter?.api_key) {
-        manager.registerProvider(new OpenRouterProvider(config.llm.openrouter.api_key, config.llm.openrouter.model));
-      } else if (primary === 'ollama') {
-        manager.registerProvider(new OllamaProvider(config.llm.ollama?.base_url, config.llm.ollama?.model));
-      } else if (primary === 'openai_compatible' && config.llm?.openai_compatible?.base_url) {
-        manager.registerProvider(new OpenAICompatibleProvider(
-          config.llm.openai_compatible.base_url,
-          config.llm.openai_compatible.model,
-          config.llm.openai_compatible.api_key,
-        ));
-      }
-
-      manager.setPrimary(primary);
+      registerLLMProviders(manager, llmConfig.llm.providers ?? {});
+      // Same routing view the daemon binds — see Check 4.
+      configureLLMTiers(manager, effectiveLlmForBinding(llmConfig));
+      // manager.chat() routes through the medium tier (with fall-up) when a
+      // tier/default is configured, else the first registered provider.
       const resp = await manager.chat(
         [{ role: 'user', content: 'Say OK' }],
         { max_tokens: 10 },
@@ -134,7 +133,7 @@ export async function runDoctor(): Promise<void> {
       results.push({ name: 'LLM Connectivity', status: 'fail', message: String(err).slice(0, 100) });
     }
   } else {
-    results.push({ name: 'LLM Connectivity', status: 'skip', message: 'No config file' });
+    results.push({ name: 'LLM Connectivity', status: 'skip', message: 'No providers configured' });
   }
 
   // ── Check 6: Browser (Chromium/Chrome) ────────────────────────────
@@ -189,9 +188,15 @@ export async function runDoctor(): Promise<void> {
 
   if (config?.stt?.provider) {
     const sttProv = config.stt.provider;
+    const { hasUsejarvisAi } = await import('../daemon/usejarvis-ai.ts');
     const hasKey = sttProv === 'ollama' || sttProv === 'local'
       || (sttProv === 'openai' && config.stt.openai?.api_key)
-      || (sttProv === 'groq' && config.stt.groq?.api_key);
+      || (sttProv === 'groq' && config.stt.groq?.api_key)
+      || (sttProv === 'sarvam' && config.stt.sarvam?.api_key)
+      // Hosted STT rides the system-owned usejarvis_ai credentials, not a
+      // cfg.stt key — "API key missing" here was a false alarm on every
+      // working hosted install.
+      || (sttProv === 'usejarvis' && hasUsejarvisAi(config));
     results.push({
       name: 'STT',
       status: hasKey ? 'ok' : 'warn',

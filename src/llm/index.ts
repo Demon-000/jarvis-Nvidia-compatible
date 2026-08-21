@@ -17,6 +17,17 @@ export { GroqProvider } from './groq.ts';
 export { GeminiProvider } from './gemini.ts';
 export { OllamaProvider } from './ollama.ts';
 export { OpenRouterProvider } from './openrouter.ts';
+export { LiteLLMProvider } from './litellm.ts';
+export { OmniRouteProvider } from './omniroute.ts';
+export { UsejarvisAIProvider } from './usejarvis.ts';
 
 // Manager
 export { LLMManager } from './manager.ts';
+
+// Tiers
+export type { Tier, TierAssignment, TierMap, TierResolution } from './tiers.ts';
+export { TIERS, TIER_FALLBACK, resolveTier, validateTierMap } from './tiers.ts';
+
+// Usage tracking
+export type { UsageRecord, DailyUsageRow } from './usage.ts';
+export { recordUsage, setUsageDatabase, getDailyRollup } from './usage.ts';

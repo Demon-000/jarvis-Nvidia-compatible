@@ -12,7 +12,7 @@ import type { AgentOrchestrator } from '../../agents/orchestrator.ts';
 import type { LLMManager } from '../../llm/manager.ts';
 import type { RoleDefinition } from '../../roles/types.ts';
 import type { ToolDefinition } from './registry.ts';
-import type { AgentTaskManager } from '../../agents/task-manager.ts';
+import type { AgentTaskManager, AsyncTask } from '../../agents/task-manager.ts';
 import { createScopedToolRegistry, type ProgressCallback } from '../../agents/sub-agent-runner.ts';
 
 export type AgentToolDeps = {
@@ -21,6 +21,9 @@ export type AgentToolDeps = {
   specialists: Map<string, RoleDefinition>;
   taskManager: AgentTaskManager;
   onProgress?: ProgressCallback;
+  /** Fires when an assigned task settles -- success OR failure (the
+   *  'done' progress event only fires on the success path). */
+  onTaskComplete?: (task: AsyncTask) => void;
 };
 
 export class HttpError extends Error {
@@ -113,6 +116,7 @@ export async function assignPersistentAgentTask(
     llmManager: deps.llmManager,
     toolRegistry: scopedRegistry,
     onProgress: deps.onProgress,
+    onComplete: deps.onTaskComplete,
   });
 
   console.log(`[ManageAgents] Assigned task ${taskId} to ${agent.agent.role.name}`);
@@ -140,13 +144,28 @@ export function listPersistentAgents(deps: AgentToolDeps) {
     busy: deps.taskManager.isAgentBusy(a.id),
   }));
 
-  const tasks = deps.taskManager.listTasks().map(t => ({
-    task_id: t.id,
-    agent_name: t.agentName,
-    status: t.status,
-    task: t.task.slice(0, 100),
-    elapsed_seconds: Math.round(((t.completedAt ?? Date.now()) - t.startedAt) / 1000),
-  }));
+  const tasks = deps.taskManager.listTasks().map(t => {
+    // Trim and clip the agent's response so the strip can render an inline
+    // preview after completion without flooding the small panel. Strip
+    // markdown noise (asterisks, leading list markers) and collapse
+    // whitespace so the snippet reads cleanly in a 2-line clamp.
+    const rawResponse = t.result?.response ?? '';
+    const cleaned = rawResponse
+      .replace(/^\s*[-*•]\s+/gm, '')
+      .replace(/[*_`]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const result_preview = cleaned ? cleaned.slice(0, 200) : null;
+    return {
+      task_id: t.id,
+      agent_name: t.agentName,
+      status: t.status,
+      task: t.task.slice(0, 200),
+      elapsed_seconds: Math.round(((t.completedAt ?? Date.now()) - t.startedAt) / 1000),
+      completed_at: t.completedAt ?? null,
+      result_preview,
+    };
+  });
 
   return {
     active_agents: agents.length,

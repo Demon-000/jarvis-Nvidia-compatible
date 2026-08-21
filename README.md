@@ -27,6 +27,7 @@ JARVIS is not a chatbot with tools. It is a persistent daemon that sees your scr
   - [Table of Contents](#table-of-contents)
   - [🔍 What Makes JARVIS Different](#-what-makes-jarvis-different)
   - [⚡ Quick Start](#-quick-start)
+  - [🪨 Ambient mode (recommended)](#-ambient-mode-recommended)
   - [☁️ Managed Hosting](#️-managed-hosting)
   - [💡 Use Cases](#-use-cases)
   - [📋 Requirements](#-requirements)
@@ -36,20 +37,20 @@ JARVIS is not a chatbot with tools. It is a persistent daemon that sees your scr
     - [One-liner](#one-liner)
     - [Manual](#manual)
   - [🚀 Usage](#-usage)
+    - [Updating](#updating)
+    - [Removing JARVIS](#removing-jarvis)
   - [🖥️ Sidecar Setup](#️-sidecar-setup)
     - [1. Install the sidecar](#1-install-the-sidecar)
     - [2. Enroll in the dashboard](#2-enroll-in-the-dashboard)
     - [3. Run the sidecar](#3-run-the-sidecar)
   - [🧠 Core Capabilities](#-core-capabilities)
-  - [🎛️ Dashboard](#️-dashboard)
   - [⚙️ Configuration](#️-configuration)
   - [🏗️ Architecture](#️-architecture)
   - [🛠️ Development](#️-development)
     - [Stack](#stack)
-  - [🗺️ Roadmap](#️-roadmap)
-    - [Upcoming](#upcoming)
   - [📖 Documentation](#-documentation)
   - [💬 Community](#-community)
+  - [📊 Telemetry](#-telemetry)
   - [🔒 Security](#-security)
   - [📄 License](#-license)
 
@@ -68,7 +69,7 @@ JARVIS is not a chatbot with tools. It is a persistent daemon that sees your scr
 | Voice with wake word | No | Yes — streaming TTS + openwakeword |
 | Goal pursuit (OKRs) | No | Yes — drill sergeant accountability |
 | Authority gating | No | Yes — runtime enforcement + audit trail |
-| LLM provider choice | Usually locked to one | 5 providers: Anthropic, OpenAI, Gemini, Ollama, Groq |
+| LLM provider choice | Usually locked to one | Anthropic, OpenAI, Gemini, Ollama, Groq, OpenRouter, OmniRoute, and more |
 
 ---
 
@@ -80,6 +81,27 @@ jarvis start -d                   # Start as background daemon
 ```
 
 Open `http://localhost:3142` — the dashboard walks you through LLM provider, voice, and a quick conversational profile interview the first time you visit.
+
+---
+
+## 🪨 Ambient mode
+
+JARVIS ships a "dashboard-less" experience built around a small cursor-following pebble — **on by default** after onboarding. Just run:
+
+```bash
+bun run start
+```
+
+What you get:
+
+- **Pebble** — a small paper-toned disc that follows your cursor. Wake-word ("Hey Jarvis"), `Ctrl+Space`, or click summons it. Long-press the disc to blind awareness instantly (privacy toggle); the eye glyph next to it shows when JARVIS is actively reading your screen.
+- **Native windows** — every dashboard room (workflows, memory, settings, …) opens as a real Windows window via voice ("open settings", "show me workflows") or `Ctrl+K`. No browser tab.
+- **Sub-pebble rail** — say "in the background, research X" and a colored sub-pebble flies to the right edge of your screen. Click it to see what the agent is doing; "open full ↗" pops a dedicated result panel.
+- **Voice-first** — "what's on my screen?", "close all background agents", "open the workflows window", "in the background, summarize today's meeting notes" — all routed inline, no LLM round-trip for the common verbs.
+
+Currently **Windows-only** (cross-platform ports planned). The `localhost:3142` dashboard still works as a fallback / debug surface.
+
+> **Opt out:** set `JARVIS_AMBIENT_UI=0` to disable the pebble + sidecar voice loop (useful for headless servers, CI, or users who only want the web dashboard).
 
 ---
 
@@ -115,12 +137,8 @@ Visit [opencove.host](https://opencove.host) to get started.
 
 - **Bun** >= 1.0 (installed automatically if missing)
 - **OS (native daemon install)**: macOS, Linux, or WSL
-- **Windows**: use WSL2 for the Bun install, or Docker for the daemon
+- **Windows**: native Windows is not supported for the daemon - use WSL2 for the Bun install, or Docker for the daemon
 - **LLM API key** — at least one of: Anthropic, OpenAI, Google Gemini, or a local Ollama instance
-- Google OAuth credentials (optional — Calendar and Gmail integration)
-- Telegram bot token (optional — notification channel)
-- Discord bot token (optional — notification channel)
-- ElevenLabs API key (optional — premium TTS)
 
 ---
 
@@ -137,7 +155,7 @@ The first time you run `jarvis start`, the daemon boots in setup mode and the da
 
 > **Restart after first-time setup:** The daemon constructs background services (heartbeat, commitments, awareness) at boot, gated on setup having already been completed. Once you finish setup in the dashboard, those services don't activate until the next start — the dashboard shows a banner reminding you. Run `jarvis restart` (or stop/start) to bring them online. This will go away in a follow-up that constructs the services in-process at setup completion.
 
-> **Note:** Native Windows installs are blocked for the JARVIS daemon. On Windows, use WSL2 for the Bun install above, or use the Docker install instead.
+> **Note:** Native Windows is not a supported platform for the JARVIS daemon. JARVIS is built for Unix-like systems (macOS, Linux, and WSL); supporting native Windows would mean porting to a fundamentally different OS, which is out of scope. On Windows, use WSL2 for the Bun install above, or use the Docker install instead.
 
 ### Docker
 
@@ -147,11 +165,10 @@ Run JARVIS on any OS with a single command — no Bun or dependencies required. 
 docker run -d --name jarvis \
   -p 3142:3142 \
   -v jarvis-data:/data \
-  -e JARVIS_API_KEY=sk-ant-your-key \
   ghcr.io/vierisid/jarvis:latest
 ```
 
-The image is available on [GHCR](https://ghcr.io/vierisid/jarvis). Configuration can be provided via environment variables or by mounting a `config.yaml` into the `/data` volume.
+The image is available on [GHCR](https://ghcr.io/vierisid/jarvis). Non-LLM configuration can be provided via environment variables or by mounting a `config.yaml` into the `/data` volume. LLM providers, API keys, and model routing are configured from the settings dashboard (open http://localhost:3142 after first boot) and stored in the database + encrypted keychain - they are not set via env vars or `config.yaml`.
 
 > **Note:** Docker runs in an isolated container, so the daemon inside it cannot access your host desktop, browser, or clipboard directly. You must still install the [sidecar](#️-sidecar-setup) on each machine where you want JARVIS to have desktop awareness and automation capabilities.
 
@@ -159,10 +176,15 @@ The image is available on [GHCR](https://ghcr.io/vierisid/jarvis). Configuration
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vierisid/jarvis/main/install.sh | bash
+```
+
+After opening a new terminal, run:
+
+```bash
 jarvis start
 ```
 
-The install script sets up Bun, clones the repo, and links the `jarvis` CLI. Then run `jarvis start` and finish setup in your browser at `http://localhost:3142`.
+The install script sets up Bun, clones the repo, and links the `jarvis` CLI. Then finish setup in your browser at `http://localhost:3142`.
 
 > **Note:** The one-liner only supports macOS, Linux, and WSL. Native Windows shells such as PowerShell, Git Bash, and CMD should use WSL2 or the Docker install instead.
 
@@ -173,6 +195,7 @@ git clone https://github.com/vierisid/jarvis.git ~/.jarvis/daemon
 cd ~/.jarvis/daemon
 bun install
 bun run build:ui
+bun link
 jarvis start
 ```
 
@@ -247,19 +270,38 @@ bun install -g @usejarvis/sidecar
 
 ### 3. Run the sidecar
 
-Paste and run the copied command on the machine where you installed the sidecar:
+Just start it:
 
 ```bash
-jarvis-sidecar --token <your-token>
+jarvis
 ```
 
-The sidecar saves the token locally, so on subsequent runs you just need:
+The first time it runs unconfigured, a small **setup window** pops up asking for
+the enrollment token — paste the token you copied and click **Connect**. The
+sidecar saves it locally (`~/.jarvis/sidecar.yaml`) and connects.
+
+Prefer the terminal / a headless box? Pass the token on the CLI instead (no
+window):
 
 ```bash
-jarvis-sidecar
+jarvis --token <your-token>
 ```
 
-Once connected, the sidecar appears as online in the Settings page where you can configure its capabilities (terminal, filesystem, desktop, browser, clipboard, screenshot, awareness).
+Either way, subsequent runs are just `jarvis` (the saved token is reused).
+
+Once connected, the sidecar appears as online in the Settings page where you can configure its capabilities (terminal, filesystem, desktop, browser, clipboard, screenshot, awareness, file watch, processes, notifications). The host-sensing observers (clipboard, file watch, process monitor, desktop notifications) run inside the sidecar on your machine and stream to the brain - the brain no longer observes its own host.
+
+### Versioning & updates
+
+The sidecar is versioned **independently of the brain** (`bun update -g @usejarvis/sidecar`, or grab a newer binary from [GitHub Releases](https://github.com/vierisid/jarvis/releases) -- the `sidecar-vX.Y.Z` releases). Run `jarvis --version` to see what you have.
+
+On connect, the brain checks the sidecar's version against its compatibility floors and surfaces the result in **Settings -> Sidecar**:
+
+- **OK** -- up to date enough; nothing to do.
+- **Update available** -- still compatible, but the brain recommends a newer sidecar; update when convenient.
+- **Update required** -- too old for this brain; the connection is refused and the sidecar logs an "update required" message. Update the sidecar and restart it.
+
+Local development builds report `dev` and are never blocked.
 
 ---
 
@@ -289,31 +331,11 @@ Once connected, the sidecar appears as online in the Settings page where you can
 
 ---
 
-## 🎛️ Dashboard
-
-Built with React 19 and Tailwind CSS 4. Served by the daemon at `http://localhost:3142`.
-
-| Page | Purpose |
-|---|---|
-| Chat | Primary conversation interface with streaming |
-| Tasks | Active commitments and background work queue |
-| Content Pipeline | Multi-step content generation and review |
-| Knowledge Graph | Visual vault explorer — entities, facts, relationships |
-| Memory | Raw vault search and inspection |
-| Calendar | Google Calendar integration with scheduling tools |
-| Agent Office | Multi-agent delegation status and role management |
-| Command Center | Tool history, execution logs, proactive notifications |
-| Authority | Approval queue, permission rules, audit trail |
-| Awareness | Live desktop feed, activity timeline, suggestions |
-| Workflows | Visual builder, execution monitor, version history |
-| Goals | OKR dashboard — kanban, timeline, and metrics views |
-| Settings | LLM providers, TTS/STT, channels, behavior config |
-
----
-
 ## ⚙️ Configuration
 
-JARVIS stores its configuration at `~/.jarvis/config.yaml`. Open the dashboard at `http://localhost:3142` after `jarvis start` for guided setup — it walks through LLM provider, voice, and a profile interview the first time. The Settings room lets you tweak channels, personality, and authority later.
+JARVIS stores its system configuration at `~/.jarvis/config.yaml`; user-level settings live in its database and are managed from the dashboard. Access is **JWT-only by default**: run `jarvis enroll "<device-name>"` and paste the printed token into the sidecar (desktop app), which connects and gives you the dashboard. Setting up without a sidecar? Temporarily add `auth:\n  insecure_open_access: true` to config.yaml, open `http://localhost:3142` after `jarvis start` for the guided setup, then **remove the flag** once your device is enrolled. The Settings room lets you tweak channels, personality, and authority later.
+
+Running the brain on another machine — a home server, a LAN box, or a VPS with a domain? Read [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for the reverse-proxy setup, `brain_domain`, device enrollment across machines, and what plain-HTTP access does and doesn't support.
 
 ```yaml
 daemon:
@@ -404,35 +426,23 @@ bun run db:init         # Initialize or reset the database
 
 ---
 
-## 🗺️ Roadmap
-
-16 milestones completed — LLM conversations, tool execution, memory vault, browser control, proactive agent, dashboard UI, multi-agent hierarchy, communication channels, native app control, voice interface, authority & autonomy, distribution & onboarding, continuous awareness, workflow automation, plugin ecosystem, and autonomous goal pursuit.
-
-**379 tests passing across 22 test files. ~65,000 lines of TypeScript + Go.**
-
-### Upcoming
-
-| Milestone | Description |
-|---|---|
-| Smart Home | Home Assistant integration |
-| Financial Intelligence | Plaid, portfolio tracking |
-| Mobile Companion | React Native dashboard |
-| Self-Improvement | Autonomous prompt evolution |
-| Multi-Modal | DALL-E 3, full video/image processing |
-| Swarm Intelligence | Multi-device coordination |
-
-See [VISION.md](VISION.md) for the full roadmap with detailed specifications.
-
----
-
 ## 📖 Documentation
 
-- [VISION.md](VISION.md) — Full roadmap and milestone specifications
-- [docs/LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) — LLM provider configuration
-- [docs/WORKFLOW_AUTOMATION.md](docs/WORKFLOW_AUTOMATION.md) — Workflow engine guide
+General:
+
+- [config.example.yaml](config.example.yaml) — Full configuration reference
+- [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) — Deploying the brain: single machine, LAN, or VPS behind a reverse proxy
+- [docs/LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) — LLM provider configuration and routing
 - [docs/VAULT_EXTRACTOR.md](docs/VAULT_EXTRACTOR.md) — Memory and knowledge vault
 - [docs/PERSONALITY_ENGINE.md](docs/PERSONALITY_ENGINE.md) — Personality and role system
-- [config.example.yaml](config.example.yaml) — Full configuration reference
+- [docs/TELEMETRY.md](docs/TELEMETRY.md) — What anonymous metrics are collected, and how to opt out
+
+Workflows (contributor reading order):
+
+- [docs/WORKFLOW_AUTOMATION.md](docs/WORKFLOW_AUTOMATION.md) — Architecture, source-tree map, and runtime walkthrough. Start here.
+- [docs/PIECE_VERIFICATION.md](docs/PIECE_VERIFICATION.md) — 8-stage checklist to verify a piece end-to-end. Required before adding or editing any piece.
+- [src/workflows/activepieces/UPSTREAM.md](src/workflows/activepieces/UPSTREAM.md) — Pinned Activepieces SHA, license posture, vendored exclusions
+- [src/workflows/pieces-library/README.md](src/workflows/pieces-library/README.md) — How community pieces are curated and installed at runtime
 
 ---
 
@@ -441,6 +451,30 @@ See [VISION.md](VISION.md) for the full roadmap with detailed specifications.
 - [Discord](https://discord.gg/ytG2PHQ6rW) — Chat with other users, ask questions, share workflows
 - [Website](https://usejarvis.dev) — Project homepage and documentation
 - [GitHub Issues](https://github.com/vierisid/jarvis/issues) — Bug reports and feature requests
+
+---
+
+## 📊 Telemetry
+
+JARVIS sends **anonymous** usage metrics so the project can measure its unique
+user base and retention. Each ping contains only a hashed machine id (derived
+from hostname + username, never reversible to either), the app version, the
+install method, and the OS/arch. No personal data, config, content, or feature
+usage is ever sent. Pings go out at startup and every hour.
+
+It is on by default (opt-out). Disable it with any of:
+
+```yaml
+# ~/.jarvis/config.yaml
+telemetry:
+  enabled: false
+```
+
+```bash
+JARVIS_TELEMETRY=0   # or the cross-tool standard: DO_NOT_TRACK=1
+```
+
+Full details: [docs/TELEMETRY.md](docs/TELEMETRY.md).
 
 ---
 
@@ -454,4 +488,6 @@ If you discover a security vulnerability, please report it privately by emailing
 
 ## 📄 License
 
-[Jarvis Source Available License 2.0](LICENSE) (based on RSALv2)
+Jarvis is distributed under the [Jarvis Source Available License 2.0](LICENSE) (based on RSALv2).
+
+The Jarvis codebase incorporates third-party components under their own licenses. Those components retain their original licenses for any party who extracts them as a standalone work; the combined Jarvis distribution is governed by the Jarvis Source Available License. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the full list and per-component license text.

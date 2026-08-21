@@ -267,7 +267,7 @@ settings room ("room": "settings"):
    matches "open the LLM tab", "switch to channels", "go to general settings"
 - "read_status" — args: {}
    matches "read the current status", "what's the LLM config", "what's connected"
-- "set_primary_llm" — args: { "provider": "anthropic"|"openai"|"groq"|"gemini"|"ollama"|"openrouter"|"nvidia" }
+- "set_primary_llm" — args: { "provider": "anthropic"|"openai"|"groq"|"gemini"|"ollama"|"openrouter"|"nvidia"|"litellm"|"omniroute" }
    matches "set primary to anthropic", "make openai the default", "switch to ollama"
 - "set_fallback_llm" — args: { "fallback": string[] | string }
    matches "set the fallback chain to openai and ollama", "use openai as fallback"
@@ -281,8 +281,9 @@ settings room ("room": "settings"):
 - "disable_telegram" — args: {}   matches "disable telegram", "turn off telegram"
 - "enable_discord" — args: {}     matches "enable discord", "turn on discord"
 - "disable_discord" — args: {}    matches "disable discord", "turn off discord"
-- "set_stt_provider" — args: { "provider": "openai"|"groq"|"sarvam"|"local" }
-   matches "use groq for transcription", "set stt to local whisper"
+- "set_stt_provider" — args: { "provider": "openai"|"groq"|"sarvam"|"local"|"usejarvis" }
+   matches "use groq for transcription", "set stt to local whisper",
+   "switch transcription to usejarvis" (the hosted plan's included STT)
 - "enable_tts" — args: {}    matches "turn on TTS", "enable text to speech"
 - "disable_tts" — args: {}   matches "turn off TTS", "disable text to speech"
 - "set_tts_provider" — args: { "provider": "edge"|"elevenlabs"|"sarvam" }
@@ -843,7 +844,7 @@ export async function classifyVoiceIntent(
   ];
 
   try {
-    const response = await llm.chat(messages, { temperature: 0, max_tokens: 400 });
+    const response = await llm.chatTier('low', 'voice_intent', messages, { temperature: 0, max_tokens: 400 });
     return parseIntent(response.content ?? '', text);
   } catch (err) {
     console.warn('[VoiceIntent] Classifier failed, falling back to permissive:', err);

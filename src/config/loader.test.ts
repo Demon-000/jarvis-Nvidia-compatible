@@ -1,18 +1,100 @@
 import { test, expect, describe, beforeEach, afterEach } from 'bun:test';
-import { loadConfig, saveConfig } from './loader.ts';
-import { DEFAULT_CONFIG } from './types.ts';
-import { existsSync } from 'node:fs';
-import { unlink } from 'node:fs/promises';
+import { loadConfig, readRawConfigFile } from './loader.ts';
+import { DEFAULT_CONFIG, USER_OWNED_SECTIONS } from './types.ts';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
 
-const TEST_CONFIG_PATH = '/tmp/jarvis-test-config.yaml';
+let TEST_CONFIG_DIR: string;
+let TEST_CONFIG_PATH: string;
+
+async function createTestConfigPath(): Promise<void> {
+  TEST_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'jarvis-test-config-'));
+  TEST_CONFIG_PATH = join(TEST_CONFIG_DIR, 'config.yaml');
+}
 
 describe('Config Loader', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
   afterEach(async () => {
-    // Clean up test config file
-    if (existsSync(TEST_CONFIG_PATH)) {
-      await unlink(TEST_CONFIG_PATH);
-    }
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  test('usejarvis_ai survives the load intact while llm: is discarded', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      TEST_CONFIG_PATH,
+      [
+        'usejarvis_ai:',
+        '  base_url: https://llm.usejarvis.host',
+        '  api_key: sk-uj-test0123456789abcdef',
+        // The llm block MUST stay ignored — DB is the sole authority there.
+        'llm:',
+        '  default: "openai:gpt-x"',
+        '  providers:',
+        '    evil: { kind: openai, api_key: sneaky }',
+        '',
+      ].join('\n'),
+    );
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.usejarvis_ai).toEqual({
+      base_url: 'https://llm.usejarvis.host',
+      api_key: 'sk-uj-test0123456789abcdef',
+    });
+    // llm from the file contributed NOTHING (existing rule, still true).
+    expect(loaded.llm.default).toBeUndefined();
+    expect(loaded.llm.providers).toEqual({});
+  });
+
+  test('reloadUsejarvisAiBlock: rotation lands, removal un-hosts, corruption keeps the current value', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    const { reloadUsejarvisAiBlock } = await import('./loader.ts');
+    await writeFile(
+      TEST_CONFIG_PATH,
+      'usejarvis_ai:\n  base_url: https://llm.usejarvis.host\n  api_key: sk-uj-old\n',
+    );
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.usejarvis_ai?.api_key).toBe('sk-uj-old');
+
+    // Provisioner rotates the key: SIGHUP re-read must pick it up.
+    await writeFile(
+      TEST_CONFIG_PATH,
+      'usejarvis_ai:\n  base_url: https://llm.usejarvis.host\n  api_key: sk-uj-rotated\n',
+    );
+    await reloadUsejarvisAiBlock(config, TEST_CONFIG_PATH);
+    expect(config.usejarvis_ai?.api_key).toBe('sk-uj-rotated');
+
+    // Corrupt file: keep the current value (a write race must not un-host).
+    await writeFile(TEST_CONFIG_PATH, 'usejarvis_ai: [unclosed\n  broken');
+    await reloadUsejarvisAiBlock(config, TEST_CONFIG_PATH);
+    expect(config.usejarvis_ai?.api_key).toBe('sk-uj-rotated');
+
+    // Block removed: the install is no longer hosted.
+    await writeFile(TEST_CONFIG_PATH, 'daemon:\n  port: 8788\n');
+    await reloadUsejarvisAiBlock(config, TEST_CONFIG_PATH);
+    expect(config.usejarvis_ai).toBeUndefined();
+  });
+
+  test('workflows SYSTEM path keys survive the user-section discard; user fields do not', async () => {
+    // A hosted/system config carries only the ready-made artifact paths;
+    // any user-tunable workflow fields in the FILE have no authority (they
+    // live in the DB) — but the paths are file-owned and must survive.
+    const yaml = `
+workflows:
+  enabled: false
+  engine_dir: /opt/jarvis-engine/\${version}
+  pieces_dir: /srv/pieces
+  piece_metadata_cache: /srv/piece-metadata.json
+`;
+    await Bun.write(TEST_CONFIG_PATH, yaml);
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.workflows?.engine_dir).toBe('/opt/jarvis-engine/\${version}');
+    expect(loaded.workflows?.pieces_dir).toBe('/srv/pieces');
+    expect(loaded.workflows?.piece_metadata_cache).toBe('/srv/piece-metadata.json');
+    // The file's `enabled: false` was discarded with the user section.
+    expect(loaded.workflows?.enabled).toBeUndefined();
   });
 
   test('returns default config when file does not exist', async () => {
@@ -27,21 +109,9 @@ describe('Config Loader', () => {
     expect(config.active_role).toBe(DEFAULT_CONFIG.active_role);
   });
 
-  test('can save and load config', async () => {
-    const testConfig = structuredClone(DEFAULT_CONFIG);
-    testConfig.daemon.port = 9999;
-    testConfig.llm.primary = 'openai';
-
-    await saveConfig(testConfig, TEST_CONFIG_PATH);
-    expect(existsSync(TEST_CONFIG_PATH)).toBe(true);
-
-    const loaded = await loadConfig(TEST_CONFIG_PATH);
-    expect(loaded.daemon.port).toBe(9999);
-    expect(loaded.llm.primary).toBe('openai');
-  });
-
-  test('deep merges partial config with defaults', async () => {
-    // Save a partial config (only some fields)
+  test('deep merges partial config with defaults; any llm block is discarded', async () => {
+    // The llm block is legacy and must be ignored entirely - LLM config
+    // comes only from the DB.
     const partialYaml = `
 daemon:
   port: 8888
@@ -56,7 +126,8 @@ llm:
 
     // Should have our custom values
     expect(loaded.daemon.port).toBe(8888);
-    expect(loaded.llm.primary).toBe('openai');
+    // The llm block has no authority and is discarded back to the empty default.
+    expect(loaded.llm).toEqual(DEFAULT_CONFIG.llm);
 
     // Should have defaults for missing values (paths are tilde-expanded)
     expect(loaded.daemon.data_dir).not.toContain('~');
@@ -64,25 +135,60 @@ llm:
     expect(loaded.authority.default_level).toBe(DEFAULT_CONFIG.authority.default_level);
   });
 
-  test('preserves all config sections', async () => {
-    await saveConfig(DEFAULT_CONFIG, TEST_CONFIG_PATH);
+  test('user-owned sections in the file have no authority (discarded like llm)', async () => {
+    // config.yaml is a SYSTEM config. User sections live in the vault DB
+    // settings store; a file that still carries them (legacy) contributes
+    // nothing to loadConfig - they are imported into the DB once at daemon
+    // boot and merged from there.
+    const legacyYaml = `
+daemon:
+  port: 7777
+personality:
+  core_traits: ["sarcastic"]
+  assistant_name: "HAL"
+active_role: "villain"
+stt:
+  provider: groq
+channels:
+  telegram:
+    enabled: true
+    bot_token: "legacy-token"
+authority:
+  default_level: 1
+`;
+    await Bun.write(TEST_CONFIG_PATH, legacyYaml);
     const loaded = await loadConfig(TEST_CONFIG_PATH);
 
-    expect(loaded.daemon).toBeDefined();
-    expect(loaded.llm).toBeDefined();
-    expect(loaded.personality).toBeDefined();
-    expect(loaded.authority).toBeDefined();
-    expect(loaded.active_role).toBeDefined();
+    // System keys stick...
+    expect(loaded.daemon.port).toBe(7777);
+    // ...user sections do not.
+    expect(loaded.personality).toEqual(DEFAULT_CONFIG.personality);
+    expect(loaded.active_role).toBe(DEFAULT_CONFIG.active_role);
+    expect(loaded.stt).toEqual(DEFAULT_CONFIG.stt);
+    expect(loaded.channels).toEqual(DEFAULT_CONFIG.channels);
+    expect(loaded.authority.default_level).toBe(DEFAULT_CONFIG.authority.default_level);
   });
 
-  test('saves YAML without forcing quoted keys', async () => {
-    await saveConfig(DEFAULT_CONFIG, TEST_CONFIG_PATH);
-    const text = await Bun.file(TEST_CONFIG_PATH).text();
-
-    expect(text).toContain('daemon:');
-    expect(text).toContain('channels:');
-    expect(text).not.toContain('"daemon":');
-    expect(text).not.toContain('"channels":');
+  test('system-owned sections survive: daemon, auth, google', async () => {
+    const systemYaml = `
+daemon:
+  port: 9090
+  brain_domain: "u1.vps1.usejarvis.host"
+  public_url: "https://jarvis.example.com"
+auth:
+  insecure_open_access: true
+google:
+  client_id: "company-client.apps.googleusercontent.com"
+  client_secret: "company-secret"
+`;
+    await Bun.write(TEST_CONFIG_PATH, systemYaml);
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.daemon.brain_domain).toBe('u1.vps1.usejarvis.host');
+    expect(loaded.daemon.public_url).toBe('https://jarvis.example.com');
+    expect(loaded.auth?.insecure_open_access).toBe(true);
+    // google is system-owned when the file provides it (hosted: the shared
+    // company OAuth client). The DB fallback only applies when absent here.
+    expect(loaded.google?.client_id).toBe('company-client.apps.googleusercontent.com');
   });
 
   test('loadConfig does not mutate DEFAULT_CONFIG', async () => {
@@ -102,7 +208,13 @@ llm:
     expect(loaded.daemon.port).toBe(12345);
     expect(DEFAULT_CONFIG).toEqual(snapshot);
 
-    // 3) Missing config file — the "defaults only" path.
+    // 3) User-section discard clones defaults — mutating the loaded config
+    // must never leak back into DEFAULT_CONFIG.
+    loaded.personality.core_traits.push('mutated');
+    (loaded.authority as { default_level: number }).default_level = 99;
+    expect(DEFAULT_CONFIG).toEqual(snapshot);
+
+    // 4) Missing config file — the "defaults only" path.
     await loadConfig('/tmp/jarvis-loader-mutation-absent.yaml');
     expect(DEFAULT_CONFIG).toEqual(snapshot);
   });
@@ -111,7 +223,7 @@ llm:
     await Bun.write(TEST_CONFIG_PATH, '');
     const loaded = await loadConfig(TEST_CONFIG_PATH);
     expect(loaded.daemon.port).toBe(DEFAULT_CONFIG.daemon.port);
-    expect(loaded.llm.primary).toBe(DEFAULT_CONFIG.llm.primary);
+    expect(loaded.llm).toEqual(DEFAULT_CONFIG.llm);
     expect(loaded.daemon.data_dir).not.toContain('~');
   });
 
@@ -136,92 +248,34 @@ llm:
       expect(msg).toMatch(/line \d+, column \d+/);
     }
   });
+});
 
-  test('preserves ambiguous scalar strings through save → load round-trip', async () => {
-    // With defaultStringType: 'PLAIN', YAML will auto-quote values that would
-    // otherwise type-coerce (booleans, numbers, dates). Verify the round-trip
-    // keeps them as strings so, e.g., a numeric-looking discord ID or a
-    // boolean-looking API token never silently mutates on reload.
-    const testConfig = structuredClone(DEFAULT_CONFIG);
-    testConfig.channels = {
-      telegram: {
-        enabled: true,
-        bot_token: 'yes',          // YAML 1.1 boolean trap
-        allowed_users: [12345],
-      },
-      discord: {
-        enabled: true,
-        bot_token: '2026-04-14',   // date-ish string
-        allowed_users: ['1234567890'],  // numeric-only string user ID
-        guild_id: '123.45',         // numeric-looking string
-      },
-    };
-
-    await saveConfig(testConfig, TEST_CONFIG_PATH);
-    const loaded = await loadConfig(TEST_CONFIG_PATH);
-
-    expect(loaded.channels?.telegram?.bot_token).toBe('yes');
-    expect(typeof loaded.channels?.telegram?.bot_token).toBe('string');
-    expect(loaded.channels?.discord?.bot_token).toBe('2026-04-14');
-    expect(typeof loaded.channels?.discord?.bot_token).toBe('string');
-    expect(loaded.channels?.discord?.guild_id).toBe('123.45');
-    expect(typeof loaded.channels?.discord?.guild_id).toBe('string');
-    expect(loaded.channels?.discord?.allowed_users).toEqual(['1234567890']);
-    expect(typeof loaded.channels?.discord?.allowed_users?.[0]).toBe('string');
+describe('readRawConfigFile', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
   });
 
-  test('save → load → save is idempotent after path normalization', async () => {
-    // loadConfig tilde-expands `daemon.data_dir` / `daemon.db_path`, so the
-    // very first save-load cycle will rewrite those values. After that, any
-    // further round-trip must be byte-identical — otherwise the YAML encoder
-    // is drifting (reordering keys, changing quoting, etc.).
-    await saveConfig(DEFAULT_CONFIG, TEST_CONFIG_PATH);
-    const stabilized = await loadConfig(TEST_CONFIG_PATH);
-    await saveConfig(stabilized, TEST_CONFIG_PATH);
-    const firstText = await Bun.file(TEST_CONFIG_PATH).text();
-
-    const reloaded = await loadConfig(TEST_CONFIG_PATH);
-    await saveConfig(reloaded, TEST_CONFIG_PATH);
-    const secondText = await Bun.file(TEST_CONFIG_PATH).text();
-
-    expect(secondText).toBe(firstText);
+  afterEach(async () => {
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
   });
 
-  test('round-trips channel config and multi-provider fallbacks', async () => {
-    const testConfig = structuredClone(DEFAULT_CONFIG);
-    testConfig.channels = {
-      telegram: {
-        enabled: true,
-        bot_token: 'telegram-token',
-        allowed_users: [12345],
-      },
-      discord: {
-        enabled: true,
-        bot_token: 'discord-token',
-        allowed_users: ['user-1'],
-        guild_id: 'guild-123',
-      },
-    };
-    testConfig.llm.primary = 'ollama';
-    testConfig.llm.fallback = ['gemini', 'openai'];
-    testConfig.llm.gemini = {
-      api_key: 'gemini-key',
-      model: 'gemini-3-flash-preview',
-    };
-    testConfig.llm.ollama = {
-      base_url: 'http://localhost:11434',
-      model: 'llama3.1',
-    };
+  test('returns the raw sections loadConfig would discard (for the legacy import)', async () => {
+    await Bun.write(
+      TEST_CONFIG_PATH,
+      'daemon:\n  port: 7777\nstt:\n  provider: groq\nactive_role: "villain"\n',
+    );
+    const raw = await readRawConfigFile(TEST_CONFIG_PATH);
+    expect(raw).not.toBeNull();
+    expect((raw!.stt as { provider: string }).provider).toBe('groq');
+    expect(raw!.active_role).toBe('villain');
+    // No defaults are merged in: absent sections stay absent.
+    expect(raw!.personality).toBeUndefined();
+  });
 
-    await saveConfig(testConfig, TEST_CONFIG_PATH);
-    const loaded = await loadConfig(TEST_CONFIG_PATH);
-
-    expect(loaded.channels?.discord?.enabled).toBe(true);
-    expect(loaded.channels?.discord?.guild_id).toBe('guild-123');
-    expect(loaded.llm.primary).toBe('ollama');
-    expect(loaded.llm.fallback).toEqual(['gemini', 'openai']);
-    expect(loaded.llm.gemini?.model).toBe('gemini-3-flash-preview');
-    expect(loaded.llm.ollama?.model).toBe('llama3.1');
+  test('returns null for a missing file and throws on bad YAML', async () => {
+    expect(await readRawConfigFile('/tmp/jarvis-definitely-not-here.yaml')).toBeNull();
+    await Bun.write(TEST_CONFIG_PATH, 'daemon:\n  port: 3142\n    bad: true\n');
+    await expect(readRawConfigFile(TEST_CONFIG_PATH)).rejects.toThrow();
   });
 });
 
@@ -233,8 +287,8 @@ describe('Default Config', () => {
     expect(DEFAULT_CONFIG.daemon.db_path).toBe('~/.jarvis/jarvis.db');
 
     expect(DEFAULT_CONFIG.llm).toBeDefined();
-    expect(DEFAULT_CONFIG.llm.primary).toBe('anthropic');
-    expect(DEFAULT_CONFIG.llm.fallback).toEqual(['openai', 'ollama']);
+    expect(DEFAULT_CONFIG.llm.providers).toBeDefined();
+    expect(DEFAULT_CONFIG.llm.tiers).toBeDefined();
 
     expect(DEFAULT_CONFIG.personality).toBeDefined();
     expect(DEFAULT_CONFIG.personality.core_traits).toBeInstanceOf(Array);
@@ -255,19 +309,33 @@ describe('Default Config', () => {
   });
 
   test('has correct LLM defaults', () => {
-    expect(DEFAULT_CONFIG.llm.anthropic?.model).toBe('claude-sonnet-4-6');
-    expect(DEFAULT_CONFIG.llm.openai?.model).toBe('gpt-5.4');
-    expect(DEFAULT_CONFIG.llm.gemini?.model).toBe('gemini-3-flash-preview');
-    expect(DEFAULT_CONFIG.llm.ollama?.model).toBe('llama3');
-    expect(DEFAULT_CONFIG.llm.ollama?.base_url).toBe('');
+    // Default config ships empty providers + tiers. Users configure their
+    // own providers via the dashboard.
+    expect(DEFAULT_CONFIG.llm.providers).toEqual({});
+    expect(DEFAULT_CONFIG.llm.tiers).toEqual({});
+    expect(DEFAULT_CONFIG.llm.default).toBeUndefined();
+  });
+
+  test('every user-owned section is a real JarvisConfig key', () => {
+    // Guards the registry against typos: a misspelled section would silently
+    // never discard/import/merge.
+    const knownKeys = new Set(Object.keys(DEFAULT_CONFIG));
+    // Sections without a default (optional in JarvisConfig) are still valid;
+    // list them explicitly so a typo can't hide behind "optional".
+    const optionalWithoutDefault = new Set(['cron', 'desktop', 'sites', 'goals', 'workflows', 'onboarding']);
+    for (const section of USER_OWNED_SECTIONS) {
+      expect(knownKeys.has(section) || optionalWithoutDefault.has(section)).toBe(true);
+    }
   });
 });
 
 describe('Config Parse Errors', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
   afterEach(async () => {
-    if (existsSync(TEST_CONFIG_PATH)) {
-      await unlink(TEST_CONFIG_PATH);
-    }
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
   });
 
   test('throws on malformed YAML when file exists', async () => {
@@ -279,7 +347,7 @@ daemon:
 `;
     await Bun.write(TEST_CONFIG_PATH, badYaml);
 
-    expect(loadConfig(TEST_CONFIG_PATH)).rejects.toThrow();
+    await expect(loadConfig(TEST_CONFIG_PATH)).rejects.toThrow();
   });
 
   test('uses defaults when file does not exist (no throw)', async () => {
@@ -306,11 +374,13 @@ daemon:
 });
 
 describe('Voice Config', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
   afterEach(async () => {
     delete process.env.JARVIS_WAKE_ENGINE;
-    if (existsSync(TEST_CONFIG_PATH)) {
-      await unlink(TEST_CONFIG_PATH);
-    }
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
   });
 
   test('defaults wake_engine to openwakeword (privacy-preserving local path)', async () => {
@@ -318,17 +388,17 @@ describe('Voice Config', () => {
     expect(config.voice?.wake_engine).toBe('openwakeword');
   });
 
-  test('round-trips user-supplied wake_engine', async () => {
+  test('file-provided voice config is discarded (user-owned, DB is authoritative)', async () => {
     const yaml = `
 voice:
   wake_engine: webspeech
 `;
     await Bun.write(TEST_CONFIG_PATH, yaml);
     const config = await loadConfig(TEST_CONFIG_PATH);
-    expect(config.voice?.wake_engine).toBe('webspeech');
+    expect(config.voice?.wake_engine).toBe('openwakeword');
   });
 
-  test('JARVIS_WAKE_ENGINE env override wins over YAML', async () => {
+  test('JARVIS_WAKE_ENGINE env override wins over YAML and the discard', async () => {
     const yaml = `
 voice:
   wake_engine: openwakeword
@@ -347,6 +417,14 @@ voice:
 });
 
 describe('Path Expansion', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
   test('expands tilde in paths', async () => {
     const config = await loadConfig();
 
@@ -356,11 +434,10 @@ describe('Path Expansion', () => {
   });
 
   test('preserves non-tilde paths', async () => {
-    const testConfig = { ...DEFAULT_CONFIG };
-    testConfig.daemon.data_dir = '/absolute/path';
-    testConfig.daemon.db_path = '/absolute/db.db';
-
-    await saveConfig(testConfig, TEST_CONFIG_PATH);
+    await Bun.write(
+      TEST_CONFIG_PATH,
+      'daemon:\n  data_dir: "/absolute/path"\n  db_path: "/absolute/db.db"\n',
+    );
     const loaded = await loadConfig(TEST_CONFIG_PATH);
 
     expect(loaded.daemon.data_dir).toBe('/absolute/path');
